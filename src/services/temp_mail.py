@@ -8,6 +8,7 @@ import re
 import time
 import json
 import logging
+from datetime import datetime
 from email import message_from_string
 from email.header import decode_header, make_header
 from email.message import Message
@@ -194,12 +195,33 @@ class TempMailService(BaseEmailService):
             response = self.http_client.request(method, url, **kwargs)
 
             if response.status_code >= 400:
+                request_headers = dict(kwargs.get("headers") or {})
+                masked_headers = {
+                    k: ("***" if k.lower() in {"x-admin-auth", "x-custom-auth", "authorization", "x-user-token"} else v)
+                    for k, v in request_headers.items()
+                }
+                request_payload = kwargs.get("json")
+                request_params = kwargs.get("params")
+                response_text = response.text[:2000]
+
+                logger.error(
+                    "TempMail API 请求失败: %s %s | status=%s | request_headers=%s | params=%s | json=%s | response_headers=%s | response_body=%s",
+                    method,
+                    url,
+                    response.status_code,
+                    masked_headers,
+                    request_params,
+                    request_payload,
+                    dict(response.headers),
+                    response_text,
+                )
+
                 error_msg = f"请求失败: {response.status_code}"
                 try:
                     error_data = response.json()
                     error_msg = f"{error_msg} - {error_data}"
                 except Exception:
-                    error_msg = f"{error_msg} - {response.text[:200]}"
+                    error_msg = f"{error_msg} - {response_text}"
                 self.update_status(False, EmailServiceError(error_msg))
                 raise EmailServiceError(error_msg)
 
@@ -272,6 +294,48 @@ class TempMailService(BaseEmailService):
                 raise
             raise EmailServiceError(f"创建邮箱失败: {e}")
 
+    def _extract_mail_timestamp(self, mail: Dict[str, Any]) -> Optional[float]:
+        """提取邮件时间戳，兼容多种字段格式。"""
+        candidates = [
+            mail.get("createdAt"),
+            mail.get("created_at"),
+            mail.get("timestamp"),
+            mail.get("date"),
+            mail.get("receivedAt"),
+            mail.get("received_at"),
+        ]
+
+        for value in candidates:
+            if value in (None, ""):
+                continue
+
+            if isinstance(value, (int, float)):
+                ts = float(value)
+                if ts > 1e12:
+                    ts /= 1000.0
+                return ts
+
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    continue
+
+                try:
+                    ts = float(text)
+                    if ts > 1e12:
+                        ts /= 1000.0
+                    return ts
+                except ValueError:
+                    pass
+
+                try:
+                    normalized = text.replace("Z", "+00:00")
+                    return datetime.fromisoformat(normalized).timestamp()
+                except Exception:
+                    continue
+
+        return None
+
     def get_verification_code(
         self,
         email: str,
@@ -305,12 +369,22 @@ class TempMailService(BaseEmailService):
         while time.time() - start_time < timeout:
             try:
                 if jwt:
-                    response = self._make_request(
-                        "GET",
-                        "/user_api/mails",
-                        params={"limit": 20, "offset": 0},
-                        headers={"x-user-token": jwt, "Content-Type": "application/json", "Accept": "application/json"},
-                    )
+                    try:
+                        response = self._make_request(
+                            "GET",
+                            "/user_api/mails",
+                            params={"limit": 20, "offset": 0},
+                            headers={"x-user-token": jwt, "Content-Type": "application/json", "Accept": "application/json"},
+                        )
+                    except EmailServiceError as e:
+                        if "401" not in str(e):
+                            raise
+                        logger.warning(f"TempMail 用户令牌不可用，回退 admin 接口查询邮件: {email}")
+                        response = self._make_request(
+                            "GET",
+                            "/admin/mails",
+                            params={"limit": 20, "offset": 0, "address": email},
+                        )
                 else:
                     response = self._make_request(
                         "GET",
@@ -327,6 +401,17 @@ class TempMailService(BaseEmailService):
                 for mail in mails:
                     mail_id = mail.get("id")
                     if not mail_id or mail_id in seen_mail_ids:
+                        continue
+
+                    mail_ts = self._extract_mail_timestamp(mail)
+                    if otp_sent_at and mail_ts and mail_ts < otp_sent_at - 2:
+                        seen_mail_ids.add(mail_id)
+                        logger.debug(
+                            "跳过旧邮件: id=%s, ts=%s, otp_sent_at=%s",
+                            mail_id,
+                            mail_ts,
+                            otp_sent_at,
+                        )
                         continue
 
                     seen_mail_ids.add(mail_id)
