@@ -53,6 +53,10 @@ token_*.json
 .DS_Store
 Thumbs.db
 
+# Test artifacts
+.pytest_cache/
+tests_runtime/
+
 # Project specific
 backups/
 /out/
