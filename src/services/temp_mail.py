@@ -39,7 +39,8 @@ class TempMailService(BaseEmailService):
             config: 配置字典，支持以下键:
                 - base_url: Worker 域名地址，如 https://mail.example.com (必需)
                 - admin_password: Admin 密码，对应 x-admin-auth header (必需)
-                - domain: 邮箱域名，如 example.com (必需)
+                - domain: 单个邮箱域名，如 example.com
+                - domains: 多个邮箱域名，如 ["example.com", "mail.example.com"]
                 - enable_prefix: 是否启用前缀，默认 True
                 - timeout: 请求超时时间，默认 30
                 - max_retries: 最大重试次数，默认 3
@@ -47,17 +48,26 @@ class TempMailService(BaseEmailService):
         """
         super().__init__(EmailServiceType.TEMP_MAIL, name)
 
-        required_keys = ["base_url", "admin_password", "domain"]
-        missing_keys = [key for key in required_keys if not (config or {}).get(key)]
+        raw_config = config or {}
+        required_keys = ["base_url", "admin_password"]
+        missing_keys = [key for key in required_keys if not raw_config.get(key)]
         if missing_keys:
             raise ValueError(f"缺少必需配置: {missing_keys}")
+
+        domains = self._normalize_domains(raw_config.get("domains"))
+        if not domains:
+            domains = self._normalize_domains(raw_config.get("domain"))
+        if not domains:
+            raise ValueError("缺少必需配置: ['domain']")
 
         default_config = {
             "enable_prefix": True,
             "timeout": 30,
             "max_retries": 3,
         }
-        self.config = {**default_config, **(config or {})}
+        self.config = {**default_config, **raw_config}
+        self.config["domains"] = domains
+        self.config["domain"] = domains[0]
 
         # 不走代理，proxy_url=None
         http_config = RequestConfig(
@@ -68,6 +78,28 @@ class TempMailService(BaseEmailService):
 
         # 邮箱缓存：email -> {jwt, address}
         self._email_cache: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _normalize_domains(value: Any) -> List[str]:
+        """归一化域名配置，兼容单值、列表和逗号/换行分隔字符串。"""
+        if value in (None, ""):
+            return []
+
+        if isinstance(value, (list, tuple, set)):
+            candidates = value
+        else:
+            candidates = re.split(r"[\n,，]+", str(value))
+
+        domains: List[str] = []
+        seen = set()
+        for candidate in candidates:
+            domain = str(candidate or "").strip().lstrip("@")
+            if not domain or domain in seen:
+                continue
+            domains.append(domain)
+            seen.add(domain)
+
+        return domains
 
     def _decode_mime_header(self, value: str) -> str:
         """解码 MIME 头，兼容 RFC 2047 编码主题。"""
@@ -255,7 +287,13 @@ class TempMailService(BaseEmailService):
         suffix = ''.join(random.choices(string.ascii_lowercase, k=random.randint(1, 3)))
         name = letters + digits + suffix
 
-        domain = self.config["domain"]
+        request_config = config or {}
+        configured_domains = self._normalize_domains(request_config.get("domains"))
+        if not configured_domains:
+            configured_domains = self._normalize_domains(request_config.get("domain"))
+        if not configured_domains:
+            configured_domains = self.config["domains"]
+        domain = random.choice(configured_domains)
         enable_prefix = self.config.get("enable_prefix", True)
 
         body = {
@@ -284,7 +322,7 @@ class TempMailService(BaseEmailService):
             # 缓存 jwt，供获取验证码时使用
             self._email_cache[address] = email_info
 
-            logger.info(f"成功创建 TempMail 邮箱: {address}")
+            logger.info(f"成功创建 TempMail 邮箱: {address} (domain={domain})")
             self.update_status(True)
             return email_info
 

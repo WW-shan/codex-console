@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+import re
 import uuid
 import random
 from datetime import datetime
@@ -208,7 +209,34 @@ def _normalize_email_service_config(
     if service_type == EmailServiceType.MOE_MAIL:
         if 'domain' in normalized and 'default_domain' not in normalized:
             normalized['default_domain'] = normalized.pop('domain')
-    elif service_type in (EmailServiceType.TEMP_MAIL, EmailServiceType.FREEMAIL):
+    elif service_type == EmailServiceType.TEMP_MAIL:
+        if 'default_domain' in normalized and 'domain' not in normalized:
+            normalized['domain'] = normalized.pop('default_domain')
+
+        raw_domains = normalized.get('domains')
+        if isinstance(raw_domains, str):
+            raw_domains = re.split(r'[\n,，]+', raw_domains)
+        elif raw_domains is None:
+            raw_domains = []
+
+        domains = []
+        seen = set()
+        for item in raw_domains:
+            domain = str(item or '').strip().lstrip('@')
+            if not domain or domain in seen:
+                continue
+            domains.append(domain)
+            seen.add(domain)
+
+        single_domain = str(normalized.get('domain') or '').strip().lstrip('@')
+        if single_domain:
+            domains = [domain for domain in domains if domain != single_domain]
+            domains.insert(0, single_domain)
+
+        if domains:
+            normalized['domains'] = domains
+            normalized['domain'] = domains[0]
+    elif service_type == EmailServiceType.FREEMAIL:
         if 'default_domain' in normalized and 'domain' not in normalized:
             normalized['domain'] = normalized.pop('default_domain')
     elif service_type == EmailServiceType.DUCK_MAIL:
@@ -1191,11 +1219,13 @@ async def get_available_email_services():
 
         for service in temp_mail_services:
             config = service.config or {}
+            domains = config.get("domains") or ([] if not config.get("domain") else [config.get("domain")])
             result["temp_mail"]["services"].append({
                 "id": service.id,
                 "name": service.name,
                 "type": "temp_mail",
                 "domain": config.get("domain"),
+                "domains": domains,
                 "priority": service.priority
             })
 

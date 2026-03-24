@@ -330,7 +330,11 @@ function updateEmailServiceOptions() {
         availableServices.temp_mail.services.forEach(service => {
             const option = document.createElement('option');
             option.value = `temp_mail:${service.id}`;
-            option.textContent = service.name + (service.domain ? ` (@${service.domain})` : '');
+            const domains = Array.isArray(service.domains) ? service.domains.filter(Boolean) : [];
+            const domainText = service.domain
+                ? (domains.length > 1 ? ` (@${service.domain} 等 ${domains.length} 个)` : ` (@${service.domain})`)
+                : '';
+            option.textContent = service.name + domainText;
             option.dataset.type = 'temp_mail';
             option.dataset.serviceId = service.id;
             optgroup.appendChild(option);

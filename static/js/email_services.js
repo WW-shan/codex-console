@@ -199,6 +199,31 @@ function switchEditSubType(subType) {
     elements.editCustomTypeBadge.textContent = CUSTOM_SUBTYPE_LABELS[subType] || CUSTOM_SUBTYPE_LABELS.moemail;
 }
 
+function parseTempmailDomains(value) {
+    const rawItems = Array.isArray(value)
+        ? value
+        : String(value || '').split(/[\n,，]+/);
+
+    const parts = rawItems
+        .map(item => String(item || '').trim().replace(/^@+/, ''))
+        .filter(Boolean);
+
+    return [...new Set(parts)];
+}
+
+function formatTempmailDomains(domains) {
+    return (domains || []).join('\n');
+}
+
+function getTempmailDomains(config) {
+    const parsed = parseTempmailDomains(config?.domains || []);
+    if (parsed.length > 0) {
+        return parsed;
+    }
+
+    return parseTempmailDomains(config?.domain || '');
+}
+
 // 加载统计信息
 async function loadStats() {
     try {
@@ -299,6 +324,17 @@ function getCustomServiceAddress(service) {
         return `${escapeHtml(host)}<div style="color: var(--text-muted); margin-top: 4px;">${escapeHtml(emailAddr)}</div>`;
     }
     const baseUrl = service.config?.base_url || '-';
+    if (service._subType === 'tempmail') {
+        const domains = getTempmailDomains(service.config);
+        if (domains.length === 0) {
+            return escapeHtml(baseUrl);
+        }
+        const primaryDomain = domains[0];
+        const domainText = domains.length > 1
+            ? `默认域名：@${escapeHtml(primaryDomain)} 等 ${domains.length} 个`
+            : `默认域名：@${escapeHtml(primaryDomain)}`;
+        return `${escapeHtml(baseUrl)}<div style="color: var(--text-muted); margin-top: 4px;">${domainText}</div>`;
+    }
     const domain = service.config?.default_domain || service.config?.domain;
     if (!domain) {
         return escapeHtml(baseUrl);
@@ -444,11 +480,18 @@ async function handleAddCustom(e) {
             default_domain: formData.get('domain')
         };
     } else if (subType === 'tempmail') {
+        const domains = parseTempmailDomains(formData.get('tm_domain'));
+        if (domains.length === 0) {
+            toast.error('请至少填写一个默认域名');
+            return;
+        }
+
         serviceType = 'temp_mail';
         config = {
             base_url: formData.get('tm_base_url'),
             admin_password: formData.get('tm_admin_password'),
-            domain: formData.get('tm_domain'),
+            domain: domains[0],
+            domains,
             enable_prefix: true
         };
     } else if (subType === 'duckmail') {
@@ -638,7 +681,7 @@ async function editCustomService(id, subType) {
             document.getElementById('edit-tm-base-url').value = service.config?.base_url || '';
             document.getElementById('edit-tm-admin-password').value = '';
             document.getElementById('edit-tm-admin-password').placeholder = service.config?.admin_password ? '已设置，留空保持不变' : '请输入 Admin 密码';
-            document.getElementById('edit-tm-domain').value = service.config?.domain || '';
+            document.getElementById('edit-tm-domain').value = formatTempmailDomains(getTempmailDomains(service.config));
         } else if (resolvedSubType === 'duckmail') {
             document.getElementById('edit-dm-base-url').value = service.config?.base_url || '';
             document.getElementById('edit-dm-api-key').value = '';
@@ -681,9 +724,16 @@ async function handleEditCustom(e) {
         const apiKey = formData.get('api_key');
         if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();
     } else if (subType === 'tempmail') {
+        const domains = parseTempmailDomains(formData.get('tm_domain'));
+        if (domains.length === 0) {
+            toast.error('请至少填写一个默认域名');
+            return;
+        }
+
         config = {
             base_url: formData.get('tm_base_url'),
-            domain: formData.get('tm_domain'),
+            domain: domains[0],
+            domains,
             enable_prefix: true
         };
         const pwd = formData.get('tm_admin_password');
