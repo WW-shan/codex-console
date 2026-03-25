@@ -58,5 +58,6 @@ Thumbs.db
 tests_runtime/
 
 # Project specific
+.worktrees/
 backups/
 /out/

@@ -761,28 +761,50 @@ def _resolve_email_service_for_account_session_bootstrap(db, account: Account, p
         raise RuntimeError(f"不支持的邮箱服务类型: {raw_type}") from exc
 
     settings = get_settings()
-    services = (
-        db.query(EmailServiceModel)
-        .filter(EmailServiceModel.service_type == service_type.value, EmailServiceModel.enabled == True)
-        .order_by(EmailServiceModel.priority.asc(), EmailServiceModel.id.asc())
-        .all()
-    )
+    email_lower = str(account.email or "").strip().lower()
+    domain = email_lower.split("@", 1)[1] if "@" in email_lower else ""
 
-    selected = None
-    if services:
-        # Outlook/IMAP 优先匹配同邮箱配置，避免拿错账户。
-        if service_type in (EmailServiceType.OUTLOOK, EmailServiceType.IMAP_MAIL):
-            email_lower = str(account.email or "").strip().lower()
-            for svc in services:
-                cfg_email = str((svc.config or {}).get("email") or "").strip().lower()
-                if cfg_email and cfg_email == email_lower:
-                    selected = svc
-                    break
-        if not selected:
-            selected = services[0]
+    def _select_service(target_type: EmailServiceType, require_domain_match: bool = False):
+        services = (
+            db.query(EmailServiceModel)
+            .filter(EmailServiceModel.service_type == target_type.value, EmailServiceModel.enabled == True)
+            .order_by(EmailServiceModel.priority.asc(), EmailServiceModel.id.asc())
+            .all()
+        )
+        selected = None
+        if services:
+            if target_type in (EmailServiceType.OUTLOOK, EmailServiceType.IMAP_MAIL):
+                for svc in services:
+                    cfg_email = str((svc.config or {}).get("email") or "").strip().lower()
+                    if cfg_email and cfg_email == email_lower:
+                        selected = svc
+                        break
+            elif target_type == EmailServiceType.TEMP_MAIL:
+                for svc in services:
+                    cfg = svc.config or {}
+                    raw_domains = cfg.get("domains") or []
+                    if isinstance(raw_domains, str):
+                        raw_domains = [item.strip().lstrip("@") for item in re.split(r"[\n,，]+", raw_domains) if str(item).strip()]
+                    normalized_domains = [str(item or "").strip().lstrip("@") for item in raw_domains if str(item or "").strip()]
+                    primary_domain = str(cfg.get("domain") or "").strip().lstrip("@")
+                    if primary_domain and primary_domain not in normalized_domains:
+                        normalized_domains.insert(0, primary_domain)
+                    if domain and domain in normalized_domains:
+                        selected = svc
+                        break
+            if not selected and not require_domain_match:
+                selected = services[0]
+        return selected
+
+    selected = _select_service(service_type)
+    effective_type = service_type
+    if not selected and service_type == EmailServiceType.TEMPMAIL:
+        selected = _select_service(EmailServiceType.TEMP_MAIL, require_domain_match=True)
+        if selected:
+            effective_type = EmailServiceType.TEMP_MAIL
 
     if selected and selected.config:
-        config = _normalize_email_service_config_for_session_bootstrap(service_type, selected.config, proxy)
+        config = _normalize_email_service_config_for_session_bootstrap(effective_type, selected.config, proxy)
     elif service_type == EmailServiceType.TEMPMAIL:
         config = {
             "base_url": settings.tempmail_base_url,
@@ -795,7 +817,7 @@ def _resolve_email_service_for_account_session_bootstrap(db, account: Account, p
             f"未找到可用邮箱服务配置(type={service_type.value})，无法自动获取登录验证码"
         )
 
-    service = EmailServiceFactory.create(service_type, config, name=f"session_bootstrap_{service_type.value}")
+    service = EmailServiceFactory.create(effective_type, config, name=f"session_bootstrap_{effective_type.value}")
     return service
 
 

@@ -3,16 +3,30 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from src.config.constants import EmailServiceType
-from src.database.models import Base, EmailService
+from src.database.models import Base, Account, EmailService
 from src.database.session import DatabaseSessionManager
 from src.services.base import EmailServiceFactory
+from src.web.routes import accounts as accounts_routes
 from src.web.routes import email as email_routes
+from src.web.routes import payment as payment_routes
 from src.web.routes import registration as registration_routes
 
 
 class DummySettings:
     custom_domain_base_url = ""
     custom_domain_api_key = None
+    tempmail_base_url = "https://api.tempmail.lol/v2"
+    tempmail_timeout = 30
+    tempmail_max_retries = 3
+
+
+@contextmanager
+def _session_get_db(manager):
+    session = manager.SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
 
 
 def test_temp_mail_service_registered():
@@ -77,15 +91,7 @@ def test_registration_available_services_include_tempmail_primary_domain(monkeyp
             )
         )
 
-    @contextmanager
-    def fake_get_db():
-        session = manager.SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
-
-    monkeypatch.setattr(registration_routes, "get_db", fake_get_db)
+    monkeypatch.setattr(registration_routes, "get_db", lambda: _session_get_db(manager))
 
     import src.config.settings as settings_module
 
@@ -98,3 +104,175 @@ def test_registration_available_services_include_tempmail_primary_domain(monkeyp
     assert result["temp_mail"]["services"][0]["name"] == "TempMail 主服务"
     assert result["temp_mail"]["services"][0]["type"] == "temp_mail"
     assert result["temp_mail"]["services"][0]["domain"] == "example.com"
+
+
+def test_build_inbox_config_falls_back_from_legacy_tempmail_account_to_matching_temp_mail(monkeypatch):
+    runtime_dir = Path("tests_runtime")
+    runtime_dir.mkdir(exist_ok=True)
+    db_path = runtime_dir / "legacy_tempmail_inbox.db"
+    if db_path.exists():
+        db_path.unlink()
+
+    manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+    Base.metadata.create_all(bind=manager.engine)
+
+    with manager.session_scope() as session:
+        session.add(
+            EmailService(
+                service_type="temp_mail",
+                name="Worker TempMail",
+                config={
+                    "base_url": "https://mail-api.wwcloud.app",
+                    "admin_password": "worker-secret",
+                    "domain": "routew.shop",
+                    "domains": ["routew.shop"],
+                },
+                enabled=True,
+                priority=0,
+            )
+        )
+
+    import src.config.settings as settings_module
+
+    monkeypatch.setattr(settings_module, "get_settings", lambda: DummySettings())
+
+    with manager.session_scope() as session:
+        resolved = accounts_routes._build_inbox_config(session, EmailServiceType.TEMPMAIL, "wkldk0q@routew.shop")
+
+    assert resolved["service_type"] == EmailServiceType.TEMP_MAIL
+    assert resolved["config"]["base_url"] == "https://mail-api.wwcloud.app"
+    assert resolved["config"]["admin_password"] == "worker-secret"
+    assert resolved["config"]["domain"] == "routew.shop"
+
+
+def test_session_bootstrap_falls_back_from_legacy_tempmail_account_to_matching_temp_mail(monkeypatch):
+    runtime_dir = Path("tests_runtime")
+    runtime_dir.mkdir(exist_ok=True)
+    db_path = runtime_dir / "legacy_tempmail_session.db"
+    if db_path.exists():
+        db_path.unlink()
+
+    manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+    Base.metadata.create_all(bind=manager.engine)
+
+    with manager.session_scope() as session:
+        session.add(
+            EmailService(
+                service_type="temp_mail",
+                name="Worker TempMail",
+                config={
+                    "base_url": "https://mail-api.wwcloud.app",
+                    "admin_password": "worker-secret",
+                    "domain": "routew.shop",
+                    "domains": ["routew.shop"],
+                },
+                enabled=True,
+                priority=0,
+            )
+        )
+        session.add(
+            Account(
+                email="wkldk0q@routew.shop",
+                password="secret",
+                email_service="tempmail",
+                email_service_id="wkldk0q@routew.shop",
+                status="active",
+            )
+        )
+
+    import src.config.settings as settings_module
+
+    monkeypatch.setattr(settings_module, "get_settings", lambda: DummySettings())
+
+    with manager.session_scope() as session:
+        account = session.query(Account).filter(Account.email == "wkldk0q@routew.shop").first()
+        service = payment_routes._resolve_email_service_for_account_session_bootstrap(session, account, proxy=None)
+
+    assert service.service_type == EmailServiceType.TEMP_MAIL
+    assert service.config["base_url"] == "https://mail-api.wwcloud.app"
+    assert service.config["admin_password"] == "worker-secret"
+
+
+def test_build_inbox_config_keeps_tempmail_defaults_when_legacy_account_domain_does_not_match(monkeypatch):
+    runtime_dir = Path("tests_runtime")
+    runtime_dir.mkdir(exist_ok=True)
+    db_path = runtime_dir / "legacy_tempmail_inbox_unmatched.db"
+    if db_path.exists():
+        db_path.unlink()
+
+    manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+    Base.metadata.create_all(bind=manager.engine)
+
+    with manager.session_scope() as session:
+        session.add(
+            EmailService(
+                service_type="temp_mail",
+                name="Worker TempMail",
+                config={
+                    "base_url": "https://mail-api.wwcloud.app",
+                    "admin_password": "worker-secret",
+                    "domain": "routew.shop",
+                    "domains": ["routew.shop"],
+                },
+                enabled=True,
+                priority=0,
+            )
+        )
+
+    import src.config.settings as settings_module
+
+    monkeypatch.setattr(settings_module, "get_settings", lambda: DummySettings())
+
+    with manager.session_scope() as session:
+        resolved = accounts_routes._build_inbox_config(session, EmailServiceType.TEMPMAIL, "user@otherdomain.com")
+
+    assert resolved["service_type"] == EmailServiceType.TEMPMAIL
+    assert resolved["config"]["base_url"] == DummySettings.tempmail_base_url
+    assert "admin_password" not in resolved["config"]
+
+
+def test_session_bootstrap_keeps_tempmail_service_when_legacy_account_domain_does_not_match(monkeypatch):
+    runtime_dir = Path("tests_runtime")
+    runtime_dir.mkdir(exist_ok=True)
+    db_path = runtime_dir / "legacy_tempmail_session_unmatched.db"
+    if db_path.exists():
+        db_path.unlink()
+
+    manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+    Base.metadata.create_all(bind=manager.engine)
+
+    with manager.session_scope() as session:
+        session.add(
+            EmailService(
+                service_type="temp_mail",
+                name="Worker TempMail",
+                config={
+                    "base_url": "https://mail-api.wwcloud.app",
+                    "admin_password": "worker-secret",
+                    "domain": "routew.shop",
+                    "domains": ["routew.shop"],
+                },
+                enabled=True,
+                priority=0,
+            )
+        )
+        session.add(
+            Account(
+                email="user@otherdomain.com",
+                password="secret",
+                email_service="tempmail",
+                email_service_id="user@otherdomain.com",
+                status="active",
+            )
+        )
+
+    import src.config.settings as settings_module
+
+    monkeypatch.setattr(settings_module, "get_settings", lambda: DummySettings())
+
+    with manager.session_scope() as session:
+        account = session.query(Account).filter(Account.email == "user@otherdomain.com").first()
+        service = payment_routes._resolve_email_service_for_account_session_bootstrap(session, account, proxy=None)
+
+    assert service.service_type == EmailServiceType.TEMPMAIL
+    assert service.config["base_url"] == DummySettings.tempmail_base_url

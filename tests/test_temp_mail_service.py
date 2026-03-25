@@ -303,6 +303,60 @@ def test_get_verification_code_fetches_mail_detail_when_list_has_no_body():
     assert code == "246810"
 
 
+
+
+def test_get_verification_code_accepts_worker_created_at_with_otp_sent_at():
+    service = TempMailService({
+        "base_url": "https://mail.example.com",
+        "admin_password": "admin-secret",
+        "domain": "routew.shop",
+    })
+    otp_sent_at = 1_700_000_000.0
+    fake_client = FakeHTTPClient([
+        FakeResponse(
+            payload={
+                "results": [
+                    {
+                        "id": "mail-old",
+                        "address": "wkldk0q@routew.shop",
+                        "source": "bounce+old@tm1.openai.com",
+                        "raw": (
+                            "Date: Tue, 14 Nov 2023 22:12:50 +0000\r\n"
+                            "Subject: Your ChatGPT code is 111111\r\n"
+                            "From: OpenAI <otp@tm1.openai.com>\r\n\r\n"
+                            "Your ChatGPT code is 111111"
+                        ),
+                        "created_at": "2023-11-14 22:12:50",
+                    },
+                    {
+                        "id": "mail-new",
+                        "address": "wkldk0q@routew.shop",
+                        "source": "bounce+new@tm1.openai.com",
+                        "raw": (
+                            "Date: Tue, 14 Nov 2023 22:13:25 +0000\r\n"
+                            "Subject: Your ChatGPT code is 222222\r\n"
+                            "From: OpenAI <otp@tm1.openai.com>\r\n\r\n"
+                            "Your ChatGPT code is 222222"
+                        ),
+                        "created_at": "2023-11-14 22:13:25",
+                    },
+                ],
+                "total": 2,
+            }
+        ),
+    ])
+    service.http_client = fake_client
+
+    code = service.get_verification_code(
+        email="wkldk0q@routew.shop",
+        timeout=1,
+        otp_sent_at=otp_sent_at,
+    )
+
+    assert code == "222222"
+
+
+
 def test_get_verification_code_admin_unfiltered_fallback():
     service = TempMailService({
         "base_url": "https://mail.example.com",

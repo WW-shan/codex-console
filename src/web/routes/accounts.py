@@ -2186,22 +2186,53 @@ async def upload_account_to_tm(account_id: int, request: Optional[UploadTMReques
 
 # ============== Inbox Code ==============
 
-def _build_inbox_config(db, service_type, email: str) -> dict:
+def _build_inbox_config(db, service_type, email: str):
     """根据账号邮箱服务类型从数据库构建服务配置（不传 proxy_url）"""
     from ...database.models import EmailService as EmailServiceModel
     from ...services import EmailServiceType as EST
 
+    domain = email.split("@")[1] if "@" in email else ""
+
+    def _match_temp_mail_service() -> dict:
+        services = db.query(EmailServiceModel).filter(
+            EmailServiceModel.service_type == "temp_mail",
+            EmailServiceModel.enabled == True
+        ).order_by(EmailServiceModel.priority.asc()).all()
+        for s in services:
+            cfg = s.config or {}
+            domains = cfg.get("domains") or []
+            if isinstance(domains, str):
+                domains = [item.strip().lstrip("@") for item in re.split(r"[\n,，]+", domains) if str(item).strip()]
+            normalized_domains = [str(item or "").strip().lstrip("@") for item in domains if str(item or "").strip()]
+            primary_domain = str(cfg.get("domain") or "").strip().lstrip("@")
+            if primary_domain and primary_domain not in normalized_domains:
+                normalized_domains.insert(0, primary_domain)
+            if domain and domain in normalized_domains:
+                matched_cfg = cfg.copy()
+                if "api_url" in matched_cfg and "base_url" not in matched_cfg:
+                    matched_cfg["base_url"] = matched_cfg.pop("api_url")
+                return {
+                    "service_type": EST.TEMP_MAIL,
+                    "config": matched_cfg,
+                }
+        return None
+
     if service_type == EST.TEMPMAIL:
+        legacy_temp_mail = _match_temp_mail_service()
+        if legacy_temp_mail:
+            return legacy_temp_mail
         settings = get_settings()
         return {
-            "base_url": settings.tempmail_base_url,
-            "timeout": settings.tempmail_timeout,
-            "max_retries": settings.tempmail_max_retries,
+            "service_type": EST.TEMPMAIL,
+            "config": {
+                "base_url": settings.tempmail_base_url,
+                "timeout": settings.tempmail_timeout,
+                "max_retries": settings.tempmail_max_retries,
+            },
         }
 
     if service_type == EST.MOE_MAIL:
         # 按域名后缀匹配，找不到则取 priority 最小的
-        domain = email.split("@")[1] if "@" in email else ""
         services = db.query(EmailServiceModel).filter(
             EmailServiceModel.service_type == "moe_mail",
             EmailServiceModel.enabled == True
@@ -2219,7 +2250,7 @@ def _build_inbox_config(db, service_type, email: str) -> dict:
         cfg = svc.config.copy()
         if "api_url" in cfg and "base_url" not in cfg:
             cfg["base_url"] = cfg.pop("api_url")
-        return cfg
+        return {"service_type": service_type, "config": cfg}
 
     # 其余服务类型：直接按 service_type 查数据库
     type_map = {
@@ -2249,7 +2280,7 @@ def _build_inbox_config(db, service_type, email: str) -> dict:
     cfg = svc.config.copy() if svc.config else {}
     if "api_url" in cfg and "base_url" not in cfg:
         cfg["base_url"] = cfg.pop("api_url")
-    return cfg
+    return {"service_type": service_type, "config": cfg}
 
 
 @router.post("/{account_id}/inbox-code")
@@ -2267,12 +2298,15 @@ async def get_account_inbox_code(account_id: int):
         except ValueError:
             return {"success": False, "error": "不支持的邮箱服务类型"}
 
-        config = _build_inbox_config(db, service_type, account.email)
-        if config is None:
+        resolved = _build_inbox_config(db, service_type, account.email)
+        if resolved is None:
             return {"success": False, "error": "未找到可用的邮箱服务配置"}
 
+        effective_type = resolved["service_type"]
+        config = resolved["config"]
+
         try:
-            svc = EmailServiceFactory.create(service_type, config)
+            svc = EmailServiceFactory.create(effective_type, config)
             code = svc.get_verification_code(
                 account.email,
                 email_id=account.email_service_id,
