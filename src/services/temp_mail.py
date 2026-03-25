@@ -312,32 +312,21 @@ class TempMailService(BaseEmailService):
 
     def _fetch_mails_once(self, email: str, jwt: Optional[str], email_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        获取一次邮件列表，按新旧接口顺序回退:
+        获取一次邮件列表，按接口顺序回退:
         1) /api/mails (Bearer jwt)
-        2) /user_api/mails (x-user-token)
-        3) /admin/mails (按地址过滤)
-        4) /admin/mails (不过滤，客户端二次筛选)
+        2) /admin/mails (按地址过滤)
+        3) /admin/mails (不过滤，客户端二次筛选)
         """
         attempts: List[Dict[str, Any]] = []
         if jwt:
-            attempts.extend([
-                {
-                    "path": "/api/mails",
-                    "params": {"limit": 50, "offset": 0},
-                    "headers": {
-                        "Authorization": f"Bearer {jwt}",
-                        "Accept": "application/json",
-                    },
+            attempts.append({
+                "path": "/api/mails",
+                "params": {"limit": 50, "offset": 0},
+                "headers": {
+                    "Authorization": f"Bearer {jwt}",
+                    "Accept": "application/json",
                 },
-                {
-                    "path": "/user_api/mails",
-                    "params": {"limit": 50, "offset": 0},
-                    "headers": {
-                        "x-user-token": jwt,
-                        "Accept": "application/json",
-                    },
-                },
-            ])
+            })
 
         attempts.append({
             "path": "/admin/mails",
@@ -352,7 +341,7 @@ class TempMailService(BaseEmailService):
             })
         attempts.append({
             "path": "/admin/mails",
-            "params": {"limit": 120, "offset": 0},
+            "params": {"limit": 80, "offset": 0},
             "headers": {"Accept": "application/json"},
         })
 
@@ -397,22 +386,15 @@ class TempMailService(BaseEmailService):
 
         attempts: List[Dict[str, Any]] = []
         if jwt:
-            attempts.extend([
+            attempts.append(
                 {
                     "path": f"/api/mails/{mail_id}",
                     "headers": {
                         "Authorization": f"Bearer {jwt}",
                         "Accept": "application/json",
                     },
-                },
-                {
-                    "path": f"/user_api/mails/{mail_id}",
-                    "headers": {
-                        "x-user-token": jwt,
-                        "Accept": "application/json",
-                    },
-                },
-            ])
+                }
+            )
         attempts.append(
             {
                 "path": f"/admin/mails/{mail_id}",
@@ -482,6 +464,33 @@ class TempMailService(BaseEmailService):
                 continue
 
         return None
+
+    def _extract_worker_metadata_code(self, mail: Dict[str, Any], pattern: str) -> Optional[str]:
+        """从 Worker metadata.ai_extract.result 中提取验证码。"""
+        metadata = mail.get("metadata")
+        if metadata in (None, ""):
+            return None
+
+        payload: Any = metadata
+        if isinstance(metadata, str):
+            try:
+                payload = json.loads(metadata)
+            except Exception:
+                return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        ai_extract = payload.get("ai_extract")
+        if not isinstance(ai_extract, dict):
+            return None
+
+        result = str(ai_extract.get("result") or "").strip()
+        if not result:
+            return None
+
+        code, _ = self._extract_otp_code(result, pattern)
+        return code
 
     def _extract_mail_timestamp(self, mail: Dict[str, Any]) -> Optional[float]:
         """从不同字段中提取邮件时间戳。"""
@@ -657,48 +666,6 @@ class TempMailService(BaseEmailService):
                 raise
             raise EmailServiceError(f"创建邮箱失败: {e}")
 
-    def _extract_mail_timestamp(self, mail: Dict[str, Any]) -> Optional[float]:
-        """提取邮件时间戳，兼容多种字段格式。"""
-        candidates = [
-            mail.get("createdAt"),
-            mail.get("created_at"),
-            mail.get("timestamp"),
-            mail.get("date"),
-            mail.get("receivedAt"),
-            mail.get("received_at"),
-        ]
-
-        for value in candidates:
-            if value in (None, ""):
-                continue
-
-            if isinstance(value, (int, float)):
-                ts = float(value)
-                if ts > 1e12:
-                    ts /= 1000.0
-                return ts
-
-            if isinstance(value, str):
-                text = value.strip()
-                if not text:
-                    continue
-
-                try:
-                    ts = float(text)
-                    if ts > 1e12:
-                        ts /= 1000.0
-                    return ts
-                except ValueError:
-                    pass
-
-                try:
-                    normalized = text.replace("Z", "+00:00")
-                    return datetime.fromisoformat(normalized).timestamp()
-                except Exception:
-                    continue
-
-        return None
-
     def get_verification_code(
         self,
         email: str,
@@ -797,6 +764,9 @@ class TempMailService(BaseEmailService):
 
                     code, semantic_hit = self._extract_otp_code(content, pattern)
                     if not code:
+                        code = self._extract_worker_metadata_code(mail, pattern)
+
+                    if not code:
                         # 部分部署列表接口只含摘要；尝试拉单封详情再匹配一次。
                         detail = self._fetch_mail_detail(mail_id=mail_id, jwt=jwt)
                         if detail:
@@ -818,6 +788,8 @@ class TempMailService(BaseEmailService):
                             ):
                                 continue
                             code, semantic_hit = self._extract_otp_code(detail_content, pattern)
+                            if not code:
+                                code = self._extract_worker_metadata_code(detail, pattern)
 
                     if not code:
                         continue

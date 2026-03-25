@@ -80,14 +80,13 @@ def test_create_email_randomly_uses_configured_domains(monkeypatch):
     assert service.config["domain"] == "example.com"
 
 
-def test_get_verification_code_fallbacks_to_admin_when_user_endpoints_fail():
+def test_get_verification_code_fallbacks_to_admin_when_api_endpoint_fails():
     service = TempMailService({
         "base_url": "https://mail.example.com",
         "admin_password": "admin-secret",
         "domain": "example.com",
     })
     fake_client = FakeHTTPClient([
-        FakeResponse(status_code=401, payload={"error": "unauthorized"}),
         FakeResponse(status_code=401, payload={"error": "unauthorized"}),
         FakeResponse(
             payload={
@@ -113,10 +112,8 @@ def test_get_verification_code_fallbacks_to_admin_when_user_endpoints_fail():
     assert code == "654321"
     assert fake_client.calls[0]["url"].endswith("/api/mails")
     assert fake_client.calls[0]["kwargs"]["headers"]["Authorization"] == "Bearer jwt-abc"
-    assert fake_client.calls[1]["url"].endswith("/user_api/mails")
-    assert fake_client.calls[1]["kwargs"]["headers"]["x-user-token"] == "jwt-abc"
-    assert fake_client.calls[2]["url"].endswith("/admin/mails")
-    assert fake_client.calls[2]["kwargs"]["params"]["address"] == email
+    assert fake_client.calls[1]["url"].endswith("/admin/mails")
+    assert fake_client.calls[1]["kwargs"]["params"]["address"] == email
 
 
 def test_get_verification_code_without_jwt_uses_admin_only():
@@ -354,6 +351,107 @@ def test_get_verification_code_accepts_worker_created_at_with_otp_sent_at():
     )
 
     assert code == "222222"
+
+
+
+def test_get_verification_code_falls_back_to_raw_date_header_when_created_at_missing():
+    service = TempMailService({
+        "base_url": "https://mail.example.com",
+        "admin_password": "admin-secret",
+        "domain": "routew.shop",
+    })
+    otp_sent_at = 1_700_000_000.0
+    fake_client = FakeHTTPClient([
+        FakeResponse(
+            payload={
+                "results": [
+                    {
+                        "id": "mail-raw-date",
+                        "address": "rawdate@routew.shop",
+                        "source": "bounce+raw@tm1.openai.com",
+                        "raw": (
+                            "Date: Tue, 14 Nov 2023 22:13:25 +0000\r\n"
+                            "Subject: Your ChatGPT code is 222222\r\n"
+                            "From: OpenAI <otp@tm1.openai.com>\r\n\r\n"
+                            "Your ChatGPT code is 222222"
+                        ),
+                    }
+                ],
+                "total": 1,
+            }
+        ),
+    ])
+    service.http_client = fake_client
+
+    code = service.get_verification_code(
+        email="rawdate@routew.shop",
+        timeout=1,
+        otp_sent_at=otp_sent_at,
+    )
+
+    assert code == "222222"
+
+
+
+def test_get_verification_code_reads_worker_ai_extract_metadata_result():
+    service = TempMailService({
+        "base_url": "https://mail.example.com",
+        "admin_password": "admin-secret",
+        "domain": "wwcloud.lol",
+    })
+    fake_client = FakeHTTPClient([
+        FakeResponse(
+            payload={
+                "results": [
+                    {
+                        "id": "mail-meta",
+                        "address": "meta@wwcloud.lol",
+                        "source": "bounce+meta@tm1.openai.com",
+                        "subject": "OpenAI verification",
+                        "created_at": "2026-03-25 19:39:51",
+                        "metadata": '{"ai_extract": {"result": "555666"}}',
+                    }
+                ],
+                "total": 1,
+            }
+        ),
+    ])
+    service.http_client = fake_client
+
+    code = service.get_verification_code(email="meta@wwcloud.lol", timeout=1)
+
+    assert code == "555666"
+
+
+
+def test_get_verification_code_admin_unfiltered_fallback_uses_safe_limit():
+    service = TempMailService({
+        "base_url": "https://mail.example.com",
+        "admin_password": "admin-secret",
+        "domain": "example.com",
+    })
+    fake_client = FakeHTTPClient([
+        FakeResponse(payload={"results": []}),
+        FakeResponse(
+            payload={
+                "results": [
+                    {
+                        "id": "mail-200",
+                        "address": "target@example.com",
+                        "source": "noreply@openai.com",
+                        "subject": "Code",
+                        "text": "135790 is your verification code",
+                    },
+                ]
+            }
+        ),
+    ])
+    service.http_client = fake_client
+
+    code = service.get_verification_code(email="target@example.com", timeout=1)
+
+    assert code == "135790"
+    assert fake_client.calls[1]["kwargs"]["params"]["limit"] == 80
 
 
 
