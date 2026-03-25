@@ -500,10 +500,10 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 # 自动上传到 Team Manager（可多服务）
                 if auto_upload_tm:
                     try:
-                        from ...core.upload.team_manager_upload import upload_to_team_manager
+                        from ...core.upload.team_manager_upload import upload_to_team_manager, has_team_manager_credentials
                         from ...database.models import Account as AccountModel
                         saved_account = db.query(AccountModel).filter_by(email=result.email).first()
-                        if saved_account and saved_account.access_token:
+                        if saved_account and has_team_manager_credentials(saved_account):
                             _tm_ids = tm_service_ids or []
                             if not _tm_ids:
                                 _tm_ids = [s.id for s in crud.get_tm_services(db, enabled=True)]

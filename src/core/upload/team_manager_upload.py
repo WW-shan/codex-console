@@ -4,7 +4,7 @@ Team Manager 上传功能
 """
 
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 from curl_cffi import requests as cffi_requests
 
@@ -12,6 +12,41 @@ from ...database.models import Account
 from ...database.session import get_db
 
 logger = logging.getLogger(__name__)
+
+
+def _has_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
+def has_team_manager_credentials(account: Account) -> bool:
+    return (
+        _has_value(account.access_token)
+        or _has_value(account.session_token)
+        or (_has_value(account.refresh_token) and _has_value(account.client_id))
+    )
+
+
+def _build_single_payload(account: Account) -> Dict[str, str]:
+    payload = {"import_type": "single"}
+
+    optional_fields = {
+        "email": account.email,
+        "access_token": account.access_token,
+        "session_token": account.session_token,
+        "refresh_token": account.refresh_token,
+        "client_id": account.client_id,
+        "account_id": account.account_id,
+    }
+
+    for key, value in optional_fields.items():
+        if _has_value(value):
+            payload[key] = value.strip() if isinstance(value, str) else value
+
+    return payload
 
 
 def upload_to_team_manager(
@@ -29,23 +64,15 @@ def upload_to_team_manager(
         return False, "Team Manager API URL 未配置"
     if not api_key:
         return False, "Team Manager API Key 未配置"
-    if not account.access_token:
-        return False, "账号缺少 access_token"
+    if not has_team_manager_credentials(account):
+        return False, "账号缺少 Team Manager 导入凭据"
 
     url = api_url.rstrip("/") + "/admin/teams/import"
     headers = {
         "X-API-Key": api_key,
         "Content-Type": "application/json",
     }
-    payload = {
-        "import_type": "single",
-        "email": account.email,
-        "access_token": account.access_token or "",
-        "session_token": account.session_token or "",
-        "refresh_token": account.refresh_token or "",
-        "client_id": account.client_id or "",
-        "account_id": account.account_id or "",
-    }
+    payload = _build_single_payload(account)
 
     try:
         resp = cffi_requests.post(
@@ -99,10 +126,10 @@ def batch_upload_to_team_manager(
                     {"id": account_id, "email": None, "success": False, "error": "账号不存在"}
                 )
                 continue
-            if not account.access_token:
+            if not has_team_manager_credentials(account):
                 results["skipped_count"] += 1
                 results["details"].append(
-                    {"id": account_id, "email": account.email, "success": False, "error": "缺少 Token"}
+                    {"id": account_id, "email": account.email, "success": False, "error": "缺少 Team Manager 导入凭据"}
                 )
                 continue
             # 格式：邮箱,AT,RT,ST,ClientID
