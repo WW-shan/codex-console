@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   webui:
-    build: .
+    image: ghcr.io/ww-shan/codex-console:latest
     shm_size: "1gb"
     ports:
       - "1455:1455"
