@@ -35,6 +35,8 @@ from ...core.openai.browser_bind import auto_bind_checkout_with_playwright
 from ...core.openai.random_billing import generate_random_billing_profile
 from ...core.openai.token_refresh import TokenRefreshManager
 from ...core.dynamic_proxy import get_proxy_url_for_task
+from ...core.openai.overview import fetch_codex_overview
+from .accounts import _persist_overview_workspace_context
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -1919,11 +1921,33 @@ def _detect_and_apply_subscription_result(
         account.subscription_type = None
         account.subscription_at = None
 
+    context_updated = False
+    context_source = ""
+    try:
+        overview = fetch_codex_overview(account, proxy=proxy)
+        context = overview.get("workspace_context") if isinstance(overview, dict) else None
+        if _persist_overview_workspace_context(account, overview):
+            context_updated = True
+        if isinstance(context, dict):
+            context_source = str(context.get("source") or "").strip()
+    except Exception as exc:
+        logger.warning(
+            "同步订阅刷新工作空间上下文失败: account_id=%s email=%s error=%s",
+            account.id,
+            account.email,
+            exc,
+        )
+
+    if context_updated:
+        suffix = f"workspace_context={context_source or 'overview'}"
+        detail["note"] = f"{note}; {suffix}" if note else suffix
+
     return {
         "status": status,
         "detail": detail,
         "refreshed": refreshed,
         "checked_at": checked_at,
+        "context_updated": context_updated,
     }
 
 

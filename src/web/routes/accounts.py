@@ -2058,6 +2058,14 @@ async def upload_account_to_cpa(account_id: int, request: Optional[CPAUploadRequ
                 "error": "账号缺少 Token，无法上传"
             }
 
+        logger.info(
+            "上传CPA前账号上下文: account_id=%s email=%s chatgpt_account_id=%s workspace_id=%s",
+            account.id,
+            account.email,
+            account.account_id or "-",
+            account.workspace_id or "-",
+        )
+
         # 生成 Token JSON
         token_data = generate_token_json(account)
 
@@ -2165,6 +2173,14 @@ async def upload_account_to_sub2api(account_id: int, request: Optional[Sub2ApiUp
         if not account.access_token:
             return {"success": False, "error": "账号缺少 Token，无法上传"}
 
+        logger.info(
+            "上传Sub2API前账号上下文: account_id=%s email=%s chatgpt_account_id=%s workspace_id=%s",
+            account.id,
+            account.email,
+            account.account_id or "-",
+            account.workspace_id or "-",
+        )
+
         success, message = upload_to_sub2api(
             [account], api_url, api_key,
             concurrency=concurrency, priority=priority,
@@ -2241,6 +2257,13 @@ async def upload_account_to_tm(account_id: int, request: Optional[UploadTMReques
         account = crud.get_account_by_id(db, account_id)
         if not account:
             raise HTTPException(status_code=404, detail="账号不存在")
+        logger.info(
+            "上传Team Manager前账号上下文: account_id=%s email=%s chatgpt_account_id=%s workspace_id=%s",
+            account.id,
+            account.email,
+            account.account_id or "-",
+            account.workspace_id or "-",
+        )
         success, message = upload_to_team_manager(account, api_url, api_key)
 
     return {"success": success, "message": message}

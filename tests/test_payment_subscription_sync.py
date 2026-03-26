@@ -64,16 +64,19 @@ def test_account_sync_subscription_updates_team_status(monkeypatch):
     def fake_detect_and_apply(*, db, account, proxy, allow_token_refresh):
         account.subscription_type = "team"
         account.subscription_at = datetime.utcnow()
+        account.account_id = "acct-new"
+        account.workspace_id = "ws-new"
         return {
             "status": "team",
             "detail": {
                 "status": "team",
                 "source": "wham_usage.no_scope.plan",
                 "confidence": "medium",
-                "note": "checked_without_scope",
+                "note": "checked_without_scope; workspace_context=me",
             },
             "refreshed": True,
             "checked_at": datetime.utcnow(),
+            "context_updated": True,
         }
 
     monkeypatch.setattr(payment_routes, "_detect_and_apply_subscription_result", fake_detect_and_apply, raising=False)
@@ -88,7 +91,7 @@ def test_account_sync_subscription_updates_team_status(monkeypatch):
             "status": "team",
             "source": "wham_usage.no_scope.plan",
             "confidence": "medium",
-            "note": "checked_without_scope",
+            "note": "checked_without_scope; workspace_context=me",
         },
         "account_id": account_id,
         "account_email": email,
@@ -98,6 +101,8 @@ def test_account_sync_subscription_updates_team_status(monkeypatch):
         saved = session.get(Account, account_id)
         assert saved.subscription_type == "team"
         assert saved.subscription_at is not None
+        assert saved.account_id == "acct-new"
+        assert saved.workspace_id == "ws-new"
 
 
 def test_account_sync_subscription_keeps_existing_team_on_low_confidence_free(monkeypatch):
@@ -106,20 +111,25 @@ def test_account_sync_subscription_keeps_existing_team_on_low_confidence_free(mo
         manager,
         subscription_type="team",
         subscription_at=datetime(2026, 3, 26, 12, 0, 0),
+        account_id="acct-old",
+        workspace_id="ws-old",
     )
     client = _build_client(monkeypatch, manager)
 
     def fake_detect_and_apply(*, db, account, proxy, allow_token_refresh):
+        account.account_id = "acct-new"
+        account.workspace_id = "ws-new"
         return {
             "status": "free",
             "detail": {
                 "status": "free",
                 "source": "wham_usage.plan",
                 "confidence": "low",
-                "note": "no_paid_signal",
+                "note": "no_paid_signal; workspace_context=me",
             },
             "refreshed": False,
             "checked_at": datetime.utcnow(),
+            "context_updated": True,
         }
 
     monkeypatch.setattr(payment_routes, "_detect_and_apply_subscription_result", fake_detect_and_apply, raising=False)
@@ -134,7 +144,7 @@ def test_account_sync_subscription_keeps_existing_team_on_low_confidence_free(mo
             "status": "free",
             "source": "wham_usage.plan",
             "confidence": "low",
-            "note": "no_paid_signal",
+            "note": "no_paid_signal; workspace_context=me",
         },
         "account_id": account_id,
         "account_email": email,
@@ -144,6 +154,8 @@ def test_account_sync_subscription_keeps_existing_team_on_low_confidence_free(mo
         saved = session.get(Account, account_id)
         assert saved.subscription_type == "team"
         assert saved.subscription_at == datetime(2026, 3, 26, 12, 0, 0)
+        assert saved.account_id == "acct-new"
+        assert saved.workspace_id == "ws-new"
 
 
 def test_account_sync_subscription_clears_existing_team_on_high_confidence_free(monkeypatch):
@@ -152,22 +164,27 @@ def test_account_sync_subscription_clears_existing_team_on_high_confidence_free(
         manager,
         subscription_type="team",
         subscription_at=datetime(2026, 3, 26, 12, 0, 0),
+        account_id="acct-old",
+        workspace_id="ws-old",
     )
     client = _build_client(monkeypatch, manager)
 
     def fake_detect_and_apply(*, db, account, proxy, allow_token_refresh):
         account.subscription_type = None
         account.subscription_at = None
+        account.account_id = "acct-new"
+        account.workspace_id = "ws-new"
         return {
             "status": "free",
             "detail": {
                 "status": "free",
                 "source": "explicit_free.plan",
                 "confidence": "high",
-                "note": "explicit_free=basic",
+                "note": "explicit_free=basic; workspace_context=me",
             },
             "refreshed": False,
             "checked_at": datetime.utcnow(),
+            "context_updated": True,
         }
 
     monkeypatch.setattr(payment_routes, "_detect_and_apply_subscription_result", fake_detect_and_apply, raising=False)
@@ -182,7 +199,7 @@ def test_account_sync_subscription_clears_existing_team_on_high_confidence_free(
             "status": "free",
             "source": "explicit_free.plan",
             "confidence": "high",
-            "note": "explicit_free=basic",
+            "note": "explicit_free=basic; workspace_context=me",
         },
         "account_id": account_id,
         "account_email": email,
@@ -192,6 +209,8 @@ def test_account_sync_subscription_clears_existing_team_on_high_confidence_free(
         saved = session.get(Account, account_id)
         assert saved.subscription_type is None
         assert saved.subscription_at is None
+        assert saved.account_id == "acct-new"
+        assert saved.workspace_id == "ws-new"
 
 
 def test_account_sync_subscription_returns_404_for_missing_account(monkeypatch):
