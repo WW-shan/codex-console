@@ -255,6 +255,27 @@ def test_run_registers_then_relogs_to_fetch_token():
     assert result.metadata["token_acquired_via_relogin"] is True
 
 
+def test_submit_login_password_accepts_codex_consent_without_setting_otp_sent_at():
+    session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["password_verify"],
+            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["SIGN_IN_WITH_CHATGPT_CODEX_CONSENT"]}}),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = session
+    engine.password = "secret-pass"
+    engine._otp_sent_at = 123.0
+
+    result = engine._submit_login_password()
+
+    assert result.success is True
+    assert result.page_type == OPENAI_PAGE_TYPES["SIGN_IN_WITH_CHATGPT_CODEX_CONSENT"]
+    assert result.is_existing_account is True
+    assert engine._otp_sent_at == 123.0
+
+
 def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     session = QueueSession([
         ("GET", "https://auth.example.test/flow/1", _response_with_did("did-1")),

@@ -2,9 +2,12 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from src.config.constants import OPENAI_PAGE_TYPES
+from src.core.register import SignupFormResult
 from src.database.models import Base, Account
 from src.database.session import DatabaseSessionManager
 from src.web.routes import payment as payment_routes
@@ -145,6 +148,105 @@ def test_account_relogin_sync_returns_404_for_missing_account(monkeypatch):
 
     assert response.status_code == 404
     assert response.json()["detail"] == "账号不存在"
+
+
+
+
+def test_account_relogin_sync_accepts_codex_consent_and_skips_login_otp(monkeypatch):
+    manager = _create_manager("payment_relogin_sync_codex_consent.db")
+    account_id, _ = _create_account(manager)
+
+    with manager.session_scope() as session:
+        account = session.get(Account, account_id)
+        calls = []
+
+        class StubEngine:
+            def __init__(self, *, email_service, proxy_url, callback_logger, task_uuid):
+                self.email_service = email_service
+                self.proxy_url = proxy_url
+                self.callback_logger = callback_logger
+                self.task_uuid = task_uuid
+                self.email = None
+                self.password = None
+                self.email_info = None
+                self._is_existing_account = False
+
+            def _prepare_authorize_flow(self, label):
+                return "did-1", "sen-1"
+
+            def _submit_login_start(self, did, sen_token):
+                return SignupFormResult(success=True, page_type=OPENAI_PAGE_TYPES["LOGIN_PASSWORD"])
+
+            def _submit_login_password(self):
+                return SignupFormResult(
+                    success=True,
+                    page_type=OPENAI_PAGE_TYPES["SIGN_IN_WITH_CHATGPT_CODEX_CONSENT"],
+                    is_existing_account=True,
+                )
+
+            def _resolve_login_password_transition(self, password_result):
+                return True, False, password_result.page_type
+
+            def _complete_token_exchange(self, result, require_login_otp=True):
+                calls.append(require_login_otp)
+                result.access_token = "access-new"
+                result.refresh_token = "refresh-new"
+                result.id_token = "id-new"
+                result.session_token = "session-new"
+                result.account_id = "acct-new"
+                result.workspace_id = "ws-new"
+                return True
+
+            def _dump_session_cookies(self):
+                return "foo=bar; __Secure-next-auth.session-token=session-new"
+
+        monkeypatch.setattr(payment_routes, "_resolve_email_service_for_account_session_bootstrap", lambda db, account, proxy: object())
+        monkeypatch.setattr(payment_routes, "RegistrationEngine", StubEngine)
+
+        result = payment_routes._relogin_and_refresh_account_snapshot(session, account, proxy=None)
+
+        assert result["message"] == "重登切组同步完成"
+        assert calls == [False]
+        assert account.access_token == "access-new"
+        assert account.refresh_token == "refresh-new"
+        assert account.id_token == "id-new"
+        assert account.session_token == "session-new"
+        assert account.account_id == "acct-new"
+        assert account.workspace_id == "ws-new"
+        assert account.cookies == "foo=bar; __Secure-next-auth.session-token=session-new"
+        assert account.last_refresh is not None
+
+
+def test_account_relogin_sync_raises_unknown_page_after_password(monkeypatch):
+    manager = _create_manager("payment_relogin_sync_unknown_page.db")
+    account_id, _ = _create_account(manager)
+
+    with manager.session_scope() as session:
+        account = session.get(Account, account_id)
+
+        class StubEngine:
+            def __init__(self, *, email_service, proxy_url, callback_logger, task_uuid):
+                self.email = None
+                self.password = None
+                self.email_info = None
+                self._is_existing_account = False
+
+            def _prepare_authorize_flow(self, label):
+                return "did-1", "sen-1"
+
+            def _submit_login_start(self, did, sen_token):
+                return SignupFormResult(success=True, page_type=OPENAI_PAGE_TYPES["LOGIN_PASSWORD"])
+
+            def _submit_login_password(self):
+                return SignupFormResult(success=True, page_type="some_unknown_page", is_existing_account=False)
+
+            def _resolve_login_password_transition(self, password_result):
+                return False, False, password_result.page_type
+
+        monkeypatch.setattr(payment_routes, "_resolve_email_service_for_account_session_bootstrap", lambda db, account, proxy: object())
+        monkeypatch.setattr(payment_routes, "RegistrationEngine", StubEngine)
+        with pytest.raises(RuntimeError, match="登录密码后返回未知页面: some_unknown_page"):
+            payment_routes._relogin_and_refresh_account_snapshot(session, account, proxy=None)
 
 
 def test_account_relogin_sync_returns_500_when_relogin_fails(monkeypatch):

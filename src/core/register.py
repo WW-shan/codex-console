@@ -91,6 +91,35 @@ class RegistrationEngine:
     负责协调邮箱服务、OAuth 流程和 OpenAI API 调用
     """
 
+    LOGIN_CONSENT_PAGE_TYPES = {
+        OPENAI_PAGE_TYPES["SIGN_IN_WITH_CHATGPT_CONSENT"],
+        OPENAI_PAGE_TYPES["SIGN_IN_WITH_CHATGPT_CODEX_CONSENT"],
+        OPENAI_PAGE_TYPES["SIGN_IN_WITH_CHATGPT_CODEX_ORG"],
+    }
+    LOGIN_PASSWORD_ACCEPTED_PAGE_TYPES = {
+        OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"],
+        *LOGIN_CONSENT_PAGE_TYPES,
+    }
+
+    def _is_login_consent_page(self, page_type: Optional[str]) -> bool:
+        return str(page_type or "").strip() in self.LOGIN_CONSENT_PAGE_TYPES
+
+    def _is_password_accepted_login_page(self, page_type: Optional[str]) -> bool:
+        return str(page_type or "").strip() in self.LOGIN_PASSWORD_ACCEPTED_PAGE_TYPES
+
+    def _requires_login_otp_page(self, page_type: Optional[str]) -> bool:
+        return str(page_type or "").strip() == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
+
+    def _resolve_login_password_transition(self, password_result: SignupFormResult) -> Tuple[bool, bool, str]:
+        page_type = str(password_result.page_type or "").strip()
+        if not password_result.success:
+            return False, False, page_type
+        if self._requires_login_otp_page(page_type):
+            return True, True, page_type
+        if self._is_login_consent_page(page_type):
+            return True, False, page_type
+        return False, False, page_type
+
     def __init__(
         self,
         email_service: BaseEmailService,
@@ -705,10 +734,12 @@ class RegistrationEngine:
                 page_type = response_data.get("page", {}).get("type", "")
                 self._log(f"登录密码响应页面类型: {page_type}")
 
-                is_existing = page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
-                if is_existing:
+                is_existing = self._is_password_accepted_login_page(page_type)
+                if self._requires_login_otp_page(page_type):
                     self._otp_sent_at = time.time()
                     self._log("登录密码校验通过，等待系统自动发送的验证码")
+                elif self._is_login_consent_page(page_type):
+                    self._log("登录密码校验通过，进入 consent 中间页，继续后续授权链路")
 
                 return SignupFormResult(
                     success=True,
@@ -1088,19 +1119,15 @@ class RegistrationEngine:
                 )
                 return False
             page_type = str(login_start_result.page_type or "").strip()
+            require_login_otp = True
             if page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
                 self._log("会话桥接自动登录已直达邮箱验证码页，跳过密码提交")
             elif page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
                 password_result = self._submit_login_password()
-                if not password_result.success:
+                login_ready, require_login_otp, password_page_type = self._resolve_login_password_transition(password_result)
+                if not login_ready:
                     self._log(
-                        f"会话桥接自动登录提交密码失败: {password_result.error_message}",
-                        "warning",
-                    )
-                    return False
-                if not password_result.is_existing_account:
-                    self._log(
-                        f"会话桥接自动登录未进入邮箱验证码页: {password_result.page_type or 'unknown'}",
+                        f"会话桥接自动登录密码阶段未进入可继续页面: {password_page_type or 'unknown'}",
                         "warning",
                     )
                     return False
@@ -1111,15 +1138,16 @@ class RegistrationEngine:
                 )
                 return False
 
-            if not self._verify_email_otp_with_retry(stage_label="会话桥接登录验证码", max_attempts=3):
-                self._log("会话桥接自动登录验证码校验失败", "warning")
-                return False
+            if require_login_otp:
+                if not self._verify_email_otp_with_retry(stage_label="会话桥接登录验证码", max_attempts=3):
+                    self._log("会话桥接自动登录验证码校验失败", "warning")
+                    return False
 
-            # OTP 成功后先直接抓一次 auth/session，避免无谓依赖 workspace 流程。
-            self._warmup_chatgpt_session()
-            if self._capture_auth_session_tokens(result, access_hint=result.access_token):
-                self._log("会话桥接自动登录在 OTP 后已命中 session_token")
-                return True
+                # OTP 成功后先直接抓一次 auth/session，避免无谓依赖 workspace 流程。
+                self._warmup_chatgpt_session()
+                if self._capture_auth_session_tokens(result, access_hint=result.access_token):
+                    self._log("会话桥接自动登录在 OTP 后已命中 session_token")
+                    return True
 
             workspace_id = self._get_workspace_id()
             if not workspace_id:
@@ -1288,11 +1316,11 @@ class RegistrationEngine:
             self._log("检测到 auth.openai.com/add-phone 风控页，当前链路未完成 OAuth 回调", "warning")
             if (not require_login_otp) and (not self._is_existing_account):
                 self._log("ABCard 入口命中 add-phone，回退原生重登链路再试一次...", "warning")
-                login_ready, login_error = self._restart_login_flow()
+                login_ready, require_login_otp_retry, login_error = self._restart_login_flow()
                 if not login_ready:
                     result.error_message = f"ABCard 回退原生链路失败: {login_error}"
                     return False
-                return self._complete_token_exchange(result, require_login_otp=True)
+                return self._complete_token_exchange(result, require_login_otp=require_login_otp_retry)
             result.error_message = "命中 add-phone 风控页，未获取到 session_token"
             return False
 
@@ -1402,21 +1430,34 @@ class RegistrationEngine:
 
         if not login_otp_ok:
             self._log("登录验证码仍未命中，尝试重触发登录 OTP 后再校验...", "warning")
-            if not self._retrigger_login_otp():
+            if self._retrigger_login_otp():
+                login_otp_ok = self._verify_email_otp_with_retry(
+                    stage_label="登录验证码(重发)",
+                    max_attempts=3,
+                    fetch_timeout=120,
+                    attempted_codes=login_otp_tried_codes,
+                )
+                if not login_otp_ok:
+                    result.error_message = "验证码校验失败"
+                    return False
+            else:
                 self._log("重触发登录 OTP 失败，尝试完整重登链路后再校验一次...", "warning")
-                login_ready, login_error = self._restart_login_flow()
+                login_ready, require_login_otp_retry, login_error = self._restart_login_flow()
                 if not login_ready:
                     result.error_message = f"登录验证码重触发失败，且完整重登失败: {login_error}"
                     return False
-            login_otp_ok = self._verify_email_otp_with_retry(
-                stage_label="登录验证码(重发)",
-                max_attempts=3,
-                fetch_timeout=120,
-                attempted_codes=login_otp_tried_codes,
-            )
-            if not login_otp_ok:
-                result.error_message = "验证码校验失败"
-                return False
+                if require_login_otp_retry:
+                    login_otp_ok = self._verify_email_otp_with_retry(
+                        stage_label="登录验证码(重发)",
+                        max_attempts=3,
+                        fetch_timeout=120,
+                        attempted_codes=login_otp_tried_codes,
+                    )
+                    if not login_otp_ok:
+                        result.error_message = "验证码校验失败"
+                        return False
+                else:
+                    return self._complete_token_exchange(result, require_login_otp=False)
 
         self._log("摸一下 Workspace ID，看看该坐哪桌...")
         workspace_id = str(self._last_validate_otp_workspace_id or "").strip()
@@ -1562,22 +1603,34 @@ class RegistrationEngine:
 
         if not login_otp_ok:
             self._log("登录验证码仍未命中，尝试重触发登录 OTP 后再校验...", "warning")
-            if not self._retrigger_login_otp():
+            if self._retrigger_login_otp():
+                login_otp_ok = self._verify_email_otp_with_retry(
+                    stage_label="登录验证码(重发)",
+                    max_attempts=3,
+                    fetch_timeout=120,
+                    attempted_codes=login_otp_tried_codes,
+                )
+                if not login_otp_ok:
+                    result.error_message = "验证码校验失败"
+                    return False
+            else:
                 self._log("重触发登录 OTP 失败，尝试完整重登链路后再校验一次...", "warning")
-                login_ready, login_error = self._restart_login_flow()
+                login_ready, require_login_otp_retry, login_error = self._restart_login_flow()
                 if not login_ready:
                     result.error_message = f"登录验证码重触发失败，且完整重登失败: {login_error}"
                     return False
-
-            login_otp_ok = self._verify_email_otp_with_retry(
-                stage_label="登录验证码(重发)",
-                max_attempts=3,
-                fetch_timeout=120,
-                attempted_codes=login_otp_tried_codes,
-            )
-        if not login_otp_ok:
-            result.error_message = "验证码校验失败"
-            return False
+                if require_login_otp_retry:
+                    login_otp_ok = self._verify_email_otp_with_retry(
+                        stage_label="登录验证码(重发)",
+                        max_attempts=3,
+                        fetch_timeout=120,
+                        attempted_codes=login_otp_tried_codes,
+                    )
+                    if not login_otp_ok:
+                        result.error_message = "验证码校验失败"
+                        return False
+                else:
+                    return self._complete_token_exchange(result, require_login_otp=False)
 
         self._log("摸一下 Workspace ID，看看该坐哪桌...")
         workspace_id = str(self._last_validate_otp_workspace_id or "").strip()
@@ -1900,7 +1953,7 @@ class RegistrationEngine:
             self._log(f"原生入口关键参数校验异常: {e}", "error")
             return False
 
-    def _restart_login_flow(self) -> Tuple[bool, str]:
+    def _restart_login_flow(self) -> Tuple[bool, bool, str]:
         """新注册账号完成建号后，重新发起一次登录流程拿 token。"""
         self._token_acquisition_requires_login = True
         self._log("注册这边忙完了，再走一趟登录把 token 请出来，收个尾...")
@@ -1908,22 +1961,23 @@ class RegistrationEngine:
 
         did, sen_token = self._prepare_authorize_flow("重新登录")
         if not did:
-            return False, "重新登录时获取 Device ID 失败"
+            return False, True, "重新登录时获取 Device ID 失败"
         if not sen_token:
-            return False, "重新登录时 Sentinel POW 验证失败"
+            return False, True, "重新登录时 Sentinel POW 验证失败"
 
         login_start_result = self._submit_login_start(did, sen_token)
         if not login_start_result.success:
-            return False, f"重新登录提交邮箱失败: {login_start_result.error_message}"
+            return False, True, f"重新登录提交邮箱失败: {login_start_result.error_message}"
         if login_start_result.page_type != OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
-            return False, f"重新登录未进入密码页面: {login_start_result.page_type or 'unknown'}"
+            return False, True, f"重新登录未进入密码页面: {login_start_result.page_type or 'unknown'}"
 
         password_result = self._submit_login_password()
-        if not password_result.success:
-            return False, f"重新登录提交密码失败: {password_result.error_message}"
-        if not password_result.is_existing_account:
-            return False, f"重新登录未进入验证码页面: {password_result.page_type or 'unknown'}"
-        return True, ""
+        login_ready, require_login_otp, password_page_type = self._resolve_login_password_transition(password_result)
+        if not login_ready:
+            if not password_result.success:
+                return False, True, f"重新登录提交密码失败: {password_result.error_message}"
+            return False, True, f"重新登录密码后返回未知页面: {password_page_type or 'unknown'}"
+        return True, require_login_otp, ""
 
     def _retrigger_login_otp(self) -> bool:
         """
@@ -1959,12 +2013,19 @@ class RegistrationEngine:
                 return False
 
             password_result = self._submit_login_password()
-            if not password_result.success:
-                self._log(f"重触发登录 OTP 失败：提交登录密码失败: {password_result.error_message}", "warning")
+            login_ready, require_login_otp, password_page_type = self._resolve_login_password_transition(password_result)
+            if not login_ready:
+                if not password_result.success:
+                    self._log(f"重触发登录 OTP 失败：提交登录密码失败: {password_result.error_message}", "warning")
+                else:
+                    self._log(
+                        f"重触发登录 OTP 失败：密码后返回未知页面（{password_page_type or 'unknown'}）",
+                        "warning",
+                    )
                 return False
-            if not password_result.is_existing_account:
+            if not require_login_otp:
                 self._log(
-                    f"重触发登录 OTP 失败：密码后未进入验证码页（{password_result.page_type or 'unknown'}）",
+                    f"重触发登录 OTP 失败：密码后进入无需 OTP 的中间页（{password_page_type or 'unknown'}）",
                     "warning",
                 )
                 return False
@@ -2712,7 +2773,7 @@ class RegistrationEngine:
                     return result
 
                 if effective_entry_flow in {"native", "outlook"}:
-                    login_ready, login_error = self._restart_login_flow()
+                    login_ready, _require_login_otp_retry, login_error = self._restart_login_flow()
                     if not login_ready:
                         result.error_message = login_error
                         return result

@@ -888,14 +888,16 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
             )
             return ""
 
+        require_login_otp = True
         if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
             password_result = engine._submit_login_password()
-            if not password_result.success or not password_result.is_existing_account:
+            login_ready, require_login_otp, password_page_type = engine._resolve_login_password_transition(password_result)
+            if not login_ready:
                 logger.warning(
                     "会话补全登录密码阶段失败: account_id=%s email=%s page_type=%s err=%s",
                     account.id,
                     account.email,
-                    password_result.page_type,
+                    password_page_type,
                     password_result.error_message,
                 )
                 return ""
@@ -908,15 +910,16 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
             )
             return ""
 
-        engine._log("等待登录验证码到场，最后这位嘉宾还在路上...")
-        engine._log("核对登录验证码，验明正身一下...")
-        if not engine._verify_email_otp_with_retry(stage_label="会话补全验证码", max_attempts=3):
-            logger.warning(
-                "会话补全登录验证码阶段失败: account_id=%s email=%s",
-                account.id,
-                account.email,
-            )
-            return ""
+        if require_login_otp:
+            engine._log("等待登录验证码到场，最后这位嘉宾还在路上...")
+            engine._log("核对登录验证码，验明正身一下...")
+            if not engine._verify_email_otp_with_retry(stage_label="会话补全验证码", max_attempts=3):
+                logger.warning(
+                    "会话补全登录验证码阶段失败: account_id=%s email=%s",
+                    account.id,
+                    account.email,
+                )
+                return ""
 
         fresh_cookies = engine._dump_session_cookies()
         # 兜底拼装关键 cookie，避免个别环境 cookie jar 导出不全。
@@ -1982,15 +1985,19 @@ def _relogin_and_refresh_account_snapshot(db, account: Account, proxy: Optional[
     if not login_start.success:
         raise RuntimeError(login_start.error_message or "提交登录入口失败")
 
+    require_login_otp = True
     if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
         password_result = engine._submit_login_password()
-        if not password_result.success or not password_result.is_existing_account:
-            raise RuntimeError(password_result.error_message or "提交登录密码失败")
+        login_ready, require_login_otp, password_page_type = engine._resolve_login_password_transition(password_result)
+        if not login_ready:
+            if not password_result.success:
+                raise RuntimeError(password_result.error_message or "提交登录密码失败")
+            raise RuntimeError(f"登录密码后返回未知页面: {password_page_type or 'unknown'}")
     elif login_start.page_type != OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
         raise RuntimeError(f"登录入口返回未知页面: {login_start.page_type}")
 
     registration_result = RegistrationResult(success=False, email=email)
-    ok = engine._complete_token_exchange(registration_result, require_login_otp=True)
+    ok = engine._complete_token_exchange(registration_result, require_login_otp=require_login_otp)
     if not ok:
         raise RuntimeError(registration_result.error_message or "重登切组同步失败")
 
