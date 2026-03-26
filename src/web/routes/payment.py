@@ -1888,6 +1888,45 @@ def _check_subscription_detail_with_retry(
     return detail, refreshed
 
 
+def _detect_and_apply_subscription_result(
+    *,
+    db,
+    account: Account,
+    proxy: Optional[str],
+    allow_token_refresh: bool,
+) -> dict:
+    detail, refreshed = _check_subscription_detail_with_retry(
+        db=db,
+        account=account,
+        proxy=proxy,
+        allow_token_refresh=allow_token_refresh,
+    )
+    detail = dict(detail or {})
+    status = str(detail.get("status") or "free").lower()
+    source = str(detail.get("source") or "unknown")
+    confidence = str(detail.get("confidence") or "low")
+    note = str(detail.get("note") or "")
+    detail["status"] = status
+    detail["source"] = source
+    detail["confidence"] = confidence
+    detail["note"] = note
+
+    checked_at = datetime.utcnow()
+    if status in ("plus", "team"):
+        account.subscription_type = status
+        account.subscription_at = checked_at
+    elif status == "free" and confidence.lower() == "high":
+        account.subscription_type = None
+        account.subscription_at = None
+
+    return {
+        "status": status,
+        "detail": detail,
+        "refreshed": refreshed,
+        "checked_at": checked_at,
+    }
+
+
 def _generate_checkout_link_for_account(
     account: Account,
     request: "CheckoutRequestBase",
@@ -2992,13 +3031,15 @@ def sync_bind_card_task_subscription(task_id: int, request: SyncBindCardTaskRequ
         proxy = _resolve_runtime_proxy(request.proxy, account)
         now = datetime.utcnow()
         try:
-            detail, refreshed = _check_subscription_detail_with_retry(
+            result = _detect_and_apply_subscription_result(
                 db=db,
                 account=account,
                 proxy=proxy,
                 allow_token_refresh=True,
             )
-            status = str(detail.get("status") or "free").lower()
+            detail = result["detail"]
+            refreshed = result["refreshed"]
+            status = result["status"]
             source = str(detail.get("source") or "unknown")
             confidence = str(detail.get("confidence") or "low")
             logger.info(
@@ -3012,15 +3053,6 @@ def sync_bind_card_task_subscription(task_id: int, request: SyncBindCardTaskRequ
             db.commit()
             logger.warning("绑卡任务同步订阅失败: task_id=%s error=%s", task.id, exc)
             raise HTTPException(status_code=500, detail=f"订阅检测失败: {exc}")
-
-        # 仅在高置信度 free 时清空；低置信度 free 不覆盖已有订阅
-        if status in ("plus", "team"):
-            account.subscription_type = status
-            account.subscription_at = now
-        elif status == "free":
-            if str(detail.get("confidence") or "").lower() == "high":
-                account.subscription_type = None
-                account.subscription_at = None
 
         task.last_checked_at = now
         if status in ("plus", "team"):
@@ -3241,6 +3273,37 @@ def delete_bind_card_task(task_id: int):
 
 # ============== 订阅状态 ==============
 
+@router.post("/accounts/{account_id}/sync-subscription")
+def sync_account_subscription(account_id: int, request: SyncBindCardTaskRequest):
+    """直接同步单个账号订阅状态，不依赖绑卡任务。"""
+    with get_db() as db:
+        account = db.query(Account).filter(Account.id == account_id).first()
+        if not account:
+            raise HTTPException(status_code=404, detail="账号不存在")
+
+        proxy = _resolve_runtime_proxy(request.proxy, account)
+        try:
+            result = _detect_and_apply_subscription_result(
+                db=db,
+                account=account,
+                proxy=proxy,
+                allow_token_refresh=True,
+            )
+        except Exception as exc:
+            logger.warning("账号管理同步订阅失败: account_id=%s error=%s", account.id, exc)
+            raise HTTPException(status_code=500, detail=f"订阅检测失败: {exc}")
+
+        db.commit()
+        effective_subscription = str(account.subscription_type or "free").lower()
+        return {
+            "success": True,
+            "subscription_type": effective_subscription,
+            "detail": result["detail"],
+            "account_id": account.id,
+            "account_email": account.email,
+        }
+
+
 @router.post("/accounts/batch-check-subscription")
 def batch_check_subscription(request: BatchCheckSubscriptionRequest):
     """批量检测账号订阅状态"""
@@ -3264,21 +3327,15 @@ def batch_check_subscription(request: BatchCheckSubscriptionRequest):
 
             try:
                 runtime_proxy = _resolve_runtime_proxy(explicit_proxy, account)
-                detail, refreshed = _check_subscription_detail_with_retry(
+                result = _detect_and_apply_subscription_result(
                     db=db,
                     account=account,
                     proxy=runtime_proxy,
                     allow_token_refresh=True,
                 )
-                status = str(detail.get("status") or "free").lower()
+                detail = result["detail"]
+                status = result["status"]
                 confidence = str(detail.get("confidence") or "low").lower()
-
-                if status in ("plus", "team"):
-                    account.subscription_type = status
-                    account.subscription_at = datetime.utcnow()
-                elif status == "free" and confidence == "high":
-                    account.subscription_type = None
-                    account.subscription_at = None
 
                 db.commit()
                 results["success_count"] += 1
@@ -3290,7 +3347,7 @@ def batch_check_subscription(request: BatchCheckSubscriptionRequest):
                         "subscription_type": status,
                         "confidence": confidence,
                         "source": detail.get("source"),
-                        "token_refreshed": refreshed,
+                        "token_refreshed": result["refreshed"],
                     }
                 )
             except Exception as e:
