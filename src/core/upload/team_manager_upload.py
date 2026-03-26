@@ -40,6 +40,7 @@ def _build_single_payload(account: Account) -> Dict[str, str]:
         "refresh_token": account.refresh_token,
         "client_id": account.client_id,
         "account_id": account.account_id,
+        "workspace_id": account.workspace_id,
     }
 
     for key, value in optional_fields.items():
@@ -47,6 +48,18 @@ def _build_single_payload(account: Account) -> Dict[str, str]:
             payload[key] = value.strip() if isinstance(value, str) else value
 
     return payload
+
+
+def _build_batch_line(account: Account) -> str:
+    return ",".join([
+        account.email or "",
+        account.access_token or "",
+        account.refresh_token or "",
+        account.session_token or "",
+        account.client_id or "",
+        account.account_id or "",
+        account.workspace_id or "",
+    ])
 
 
 def upload_to_team_manager(
@@ -132,14 +145,8 @@ def batch_upload_to_team_manager(
                     {"id": account_id, "email": account.email, "success": False, "error": "缺少 Team Manager 导入凭据"}
                 )
                 continue
-            # 格式：邮箱,AT,RT,ST,ClientID
-            lines.append(",".join([
-                account.email or "",
-                account.access_token or "",
-                account.refresh_token or "",
-                account.session_token or "",
-                account.client_id or "",
-            ]))
+            # 格式：邮箱,AT,RT,ST,ClientID,AccountID,WorkspaceID
+            lines.append(_build_batch_line(account))
             valid_accounts.append(account)
 
         if not valid_accounts:

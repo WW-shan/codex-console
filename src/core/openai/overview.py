@@ -116,6 +116,94 @@ def _extract_chatgpt_account_id_from_jwt(token: Optional[str]) -> Optional[str]:
     return None
 
 
+def _extract_workspace_context_from_payload(payload: Dict[str, Any], source_name: str) -> Dict[str, str]:
+    if not isinstance(payload, dict) or not payload:
+        return {}
+
+    account_id = ""
+    workspace_id = ""
+
+    for key in ("chatgpt_account_id", "account_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            account_id = value
+            break
+
+    for key in ("workspace_id", "organization_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            workspace_id = value
+            break
+
+    account_block = payload.get("account")
+    if isinstance(account_block, dict):
+        if not account_id:
+            account_id = str(
+                account_block.get("chatgpt_account_id")
+                or account_block.get("account_id")
+                or ""
+            ).strip()
+        if not workspace_id:
+            workspace_id = str(
+                account_block.get("workspace_id")
+                or account_block.get("organization_id")
+                or ""
+            ).strip()
+
+    orgs = []
+    org_block = payload.get("orgs")
+    if isinstance(org_block, dict):
+        orgs = org_block.get("data") or []
+    if isinstance(orgs, list):
+        for org in orgs:
+            if not isinstance(org, dict):
+                continue
+            if not workspace_id:
+                workspace_id = str(
+                    org.get("workspace_id")
+                    or org.get("id")
+                    or org.get("organization_id")
+                    or ""
+                ).strip()
+            if not account_id:
+                account_id = str(org.get("account_id") or org.get("chatgpt_account_id") or "").strip()
+            if account_id and workspace_id:
+                break
+
+    context: Dict[str, str] = {}
+    if account_id:
+        context["account_id"] = account_id
+    if workspace_id:
+        context["workspace_id"] = workspace_id
+    if context:
+        context["source"] = source_name
+    return context
+
+
+def _extract_latest_workspace_context(account: Account, payloads: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    for source_name in ("me", "wham_usage", "codex_usage"):
+        context = _extract_workspace_context_from_payload(payloads.get(source_name) or {}, source_name)
+        if context.get("account_id") or context.get("workspace_id"):
+            return context
+
+    fallback: Dict[str, str] = {}
+    token_account_id = (
+        _extract_chatgpt_account_id_from_jwt(account.access_token)
+        or _extract_chatgpt_account_id_from_jwt(account.id_token)
+    )
+    if token_account_id:
+        fallback["account_id"] = token_account_id
+    workspace_id = str(account.workspace_id or "").strip()
+    if workspace_id:
+        fallback["workspace_id"] = workspace_id
+    db_account_id = str(account.account_id or "").strip()
+    if db_account_id and not fallback.get("account_id"):
+        fallback["account_id"] = db_account_id
+    if fallback:
+        fallback["source"] = "fallback"
+    return fallback
+
+
 def _extract_chatgpt_plan_from_jwt(token: Optional[str]) -> Optional[str]:
     payload = _decode_jwt_payload(token)
     if not payload:
@@ -751,6 +839,7 @@ def fetch_codex_overview(account: Account, proxy: Optional[str] = None) -> Dict[
         raise RuntimeError("所有概览接口请求失败")
 
     plan_type, plan_source = _detect_plan(account, payloads)
+    workspace_context = _extract_latest_workspace_context(account, payloads)
     hourly_quota = _extract_quota("hourly", payloads)
     weekly_quota = _extract_quota("weekly", payloads)
     code_review_quota = _extract_code_review_quota(payloads)
@@ -758,6 +847,7 @@ def fetch_codex_overview(account: Account, proxy: Optional[str] = None) -> Dict[
     return {
         "plan_type": plan_type,
         "plan_source": plan_source,
+        "workspace_context": workspace_context,
         "hourly_quota": hourly_quota,
         "weekly_quota": weekly_quota,
         "code_review_quota": code_review_quota,

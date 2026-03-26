@@ -598,6 +598,9 @@ def _get_account_overview_data(
                     plan_source,
                 )
 
+        if _persist_overview_workspace_context(account, overview):
+            updated = True
+
         merged_extra = dict(extra_data)
         merged_extra[OVERVIEW_EXTRA_DATA_KEY] = overview
         account.extra_data = merged_extra
@@ -611,6 +614,24 @@ def _get_account_overview_data(
             stale_cached["error"] = str(exc)
             return stale_cached, updated
         return _fallback_overview(account, error_message=str(exc), stale=True), updated
+
+
+def _persist_overview_workspace_context(account: Account, overview: Dict[str, Any]) -> bool:
+    context = overview.get("workspace_context") if isinstance(overview, dict) else None
+    if not isinstance(context, dict):
+        return False
+
+    updated = False
+    account_id = str(context.get("account_id") or "").strip()
+    workspace_id = str(context.get("workspace_id") or "").strip()
+
+    if account_id and account_id != str(account.account_id or "").strip():
+        account.account_id = account_id
+        updated = True
+    if workspace_id and workspace_id != str(account.workspace_id or "").strip():
+        account.workspace_id = workspace_id
+        updated = True
+    return updated
 
 
 # ============== API Endpoints ==============

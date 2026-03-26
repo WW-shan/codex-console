@@ -55,6 +55,7 @@ def make_account(**overrides):
         "refresh_token": None,
         "client_id": None,
         "account_id": None,
+        "workspace_id": None,
     }
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -137,6 +138,32 @@ def test_upload_to_team_manager_accepts_refresh_token_with_client_id(monkeypatch
     }
 
 
+def test_upload_to_team_manager_includes_workspace_context(monkeypatch):
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, "kwargs": kwargs})
+        return FakeResponse(status_code=200)
+
+    monkeypatch.setattr(tm_upload.cffi_requests, "post", fake_post)
+
+    success, message = tm_upload.upload_to_team_manager(
+        make_account(access_token="at-123", account_id="team-account", workspace_id="team-workspace"),
+        api_url="https://tm.example.com",
+        api_key="key-123",
+    )
+
+    assert success is True
+    assert message == "上传成功"
+    assert calls[0]["kwargs"]["json"] == {
+        "import_type": "single",
+        "email": "tester@example.com",
+        "access_token": "at-123",
+        "account_id": "team-account",
+        "workspace_id": "team-workspace",
+    }
+
+
 
 def test_upload_to_team_manager_rejects_account_without_supported_credentials(monkeypatch):
     called = False
@@ -187,9 +214,9 @@ def test_upload_to_team_manager_omits_blank_optional_fields(monkeypatch):
 def test_batch_upload_to_team_manager_accepts_supported_credential_variants(monkeypatch):
     calls = []
     accounts = {
-        1: make_account(id=1, email="st@example.com", session_token="st-123"),
-        2: make_account(id=2, email="rt@example.com", refresh_token="rt-123", client_id="client-123"),
-        3: make_account(id=3, email="at@example.com", access_token="at-123"),
+        1: make_account(id=1, email="st@example.com", session_token="st-123", account_id="acct-1", workspace_id="ws-1"),
+        2: make_account(id=2, email="rt@example.com", refresh_token="rt-123", client_id="client-123", account_id="acct-2", workspace_id="ws-2"),
+        3: make_account(id=3, email="at@example.com", access_token="at-123", account_id="acct-3", workspace_id="ws-3"),
         4: make_account(id=4, email="invalid@example.com"),
     }
 
@@ -218,9 +245,9 @@ def test_batch_upload_to_team_manager_accepts_supported_credential_variants(monk
     assert calls[0]["kwargs"]["json"] == {
         "import_type": "batch",
         "content": "\n".join([
-            "st@example.com,,,st-123,",
-            "rt@example.com,,rt-123,,client-123",
-            "at@example.com,at-123,,,",
+            "st@example.com,,,st-123,,acct-1,ws-1",
+            "rt@example.com,,rt-123,,client-123,acct-2,ws-2",
+            "at@example.com,at-123,,,,acct-3,ws-3",
         ]),
     }
     invalid_detail = next(detail for detail in results["details"] if detail["id"] == 4)
