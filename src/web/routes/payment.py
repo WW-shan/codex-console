@@ -1977,9 +1977,32 @@ def _relogin_and_refresh_account_snapshot(db, account: Account, proxy: Optional[
     engine.email_info = {"service_id": account.email_service_id} if account.email_service_id else {}
     engine._is_existing_account = True
 
+    def _prime_engine_session_from_account() -> None:
+        session_obj = getattr(engine, "session", None)
+        if session_obj is None:
+            return
+        cookies_text = str(account.cookies or "").strip()
+        if cookies_text:
+            _seed_cookie_jar_from_text(session_obj, cookies_text)
+        device_id = _resolve_account_device_id(account)
+        if device_id:
+            try:
+                session_obj.cookies.set("oai-did", device_id, domain=".chatgpt.com", path="/")
+            except Exception:
+                pass
+
+    init_session = getattr(engine, "_init_session", None)
+    if callable(init_session):
+        try:
+            if init_session():
+                _prime_engine_session_from_account()
+        except Exception:
+            pass
+
     did, sen_token = engine._prepare_authorize_flow("重登切组同步")
     if not did:
         raise RuntimeError("初始化授权流程失败")
+    _prime_engine_session_from_account()
 
     login_start = engine._submit_login_start(did, sen_token)
     if not login_start.success:
@@ -2001,7 +2024,18 @@ def _relogin_and_refresh_account_snapshot(db, account: Account, proxy: Optional[
     if not ok:
         raise RuntimeError(registration_result.error_message or "重登切组同步失败")
 
+    ensure_session_token = getattr(engine, "_ensure_session_token_strict", None)
+    if (not registration_result.session_token) and callable(ensure_session_token):
+        if not ensure_session_token(registration_result, max_rounds=2):
+            raise RuntimeError("重登切组同步未获取到 session_token")
+
     latest_cookies = str(engine._dump_session_cookies() or "").strip()
+    if registration_result.session_token:
+        latest_cookies = _upsert_cookie(
+            latest_cookies or str(account.cookies or "").strip(),
+            "__Secure-next-auth.session-token",
+            registration_result.session_token,
+        )
     updated = {
         "access_token": False,
         "refresh_token": False,

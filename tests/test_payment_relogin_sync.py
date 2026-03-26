@@ -158,7 +158,21 @@ def test_account_relogin_sync_accepts_codex_consent_and_skips_login_otp(monkeypa
 
     with manager.session_scope() as session:
         account = session.get(Account, account_id)
+        account.cookies = "foo=bar; oai-did=did-old; __Secure-next-auth.session-token=session-old"
         calls = []
+        seeded = []
+        ensured = []
+
+        class DummyCookies:
+            def __init__(self):
+                self.values = {}
+
+            def set(self, name, value, domain=None, path=None):
+                self.values[(name, domain, path)] = value
+
+        class DummySession:
+            def __init__(self):
+                self.cookies = DummyCookies()
 
         class StubEngine:
             def __init__(self, *, email_service, proxy_url, callback_logger, task_uuid):
@@ -170,8 +184,14 @@ def test_account_relogin_sync_accepts_codex_consent_and_skips_login_otp(monkeypa
                 self.password = None
                 self.email_info = None
                 self._is_existing_account = False
+                self.session = DummySession()
+
+            def _init_session(self):
+                calls.append("init_session")
+                return True
 
             def _prepare_authorize_flow(self, label):
+                calls.append(("prepare", label))
                 return "did-1", "sen-1"
 
             def _submit_login_start(self, did, sen_token):
@@ -192,28 +212,38 @@ def test_account_relogin_sync_accepts_codex_consent_and_skips_login_otp(monkeypa
                 result.access_token = "access-new"
                 result.refresh_token = "refresh-new"
                 result.id_token = "id-new"
-                result.session_token = "session-new"
                 result.account_id = "acct-new"
                 result.workspace_id = "ws-new"
                 return True
 
+            def _ensure_session_token_strict(self, result, max_rounds=2):
+                ensured.append(max_rounds)
+                result.session_token = "session-new"
+                return True
+
             def _dump_session_cookies(self):
-                return "foo=bar; __Secure-next-auth.session-token=session-new"
+                return "foo=bar; oai-did=did-old"
+
+        def fake_seed(session_obj, cookies_text):
+            seeded.append(cookies_text)
 
         monkeypatch.setattr(payment_routes, "_resolve_email_service_for_account_session_bootstrap", lambda db, account, proxy: object())
         monkeypatch.setattr(payment_routes, "RegistrationEngine", StubEngine)
+        monkeypatch.setattr(payment_routes, "_seed_cookie_jar_from_text", fake_seed)
 
         result = payment_routes._relogin_and_refresh_account_snapshot(session, account, proxy=None)
 
         assert result["message"] == "重登切组同步完成"
-        assert calls == [False]
+        assert calls == ["init_session", ("prepare", "重登切组同步"), False]
+        assert seeded == ["foo=bar; oai-did=did-old; __Secure-next-auth.session-token=session-old", "foo=bar; oai-did=did-old; __Secure-next-auth.session-token=session-old"]
+        assert ensured == [2]
         assert account.access_token == "access-new"
         assert account.refresh_token == "refresh-new"
         assert account.id_token == "id-new"
         assert account.session_token == "session-new"
         assert account.account_id == "acct-new"
         assert account.workspace_id == "ws-new"
-        assert account.cookies == "foo=bar; __Secure-next-auth.session-token=session-new"
+        assert account.cookies == "foo=bar; oai-did=did-old; __Secure-next-auth.session-token=session-new"
         assert account.last_refresh is not None
 
 
