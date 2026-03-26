@@ -22,7 +22,7 @@ from ...database.models import Account, BindCardTask, EmailService as EmailServi
 from ...config.settings import get_settings
 from ...config.constants import OPENAI_PAGE_TYPES
 from ...services import EmailServiceFactory, EmailServiceType
-from ...core.register import RegistrationEngine
+from ...core.register import RegistrationEngine, RegistrationResult
 from .accounts import resolve_account_ids
 from ...core.openai.payment import (
     generate_plus_checkout_bundle,
@@ -1951,6 +1951,91 @@ def _detect_and_apply_subscription_result(
     }
 
 
+def _relogin_and_refresh_account_snapshot(db, account: Account, proxy: Optional[str]) -> dict:
+    email = str(account.email or "").strip()
+    password = str(account.password or "").strip()
+    email_service_type = str(account.email_service or "").strip()
+    if not email or not password or not email_service_type:
+        raise HTTPException(status_code=400, detail="账号缺少邮箱、密码或邮箱服务，无法自动重登切组")
+
+    try:
+        email_service = _resolve_email_service_for_account_session_bootstrap(db, account, proxy)
+    except Exception as exc:
+        raise RuntimeError(f"无法创建邮箱服务: {exc}") from exc
+
+    engine = RegistrationEngine(
+        email_service=email_service,
+        proxy_url=proxy,
+        callback_logger=lambda msg: logger.info("重登切组同步: %s", msg),
+        task_uuid=None,
+    )
+    engine.email = email
+    engine.password = password
+    engine.email_info = {"service_id": account.email_service_id} if account.email_service_id else {}
+    engine._is_existing_account = True
+
+    did, sen_token = engine._prepare_authorize_flow("重登切组同步")
+    if not did:
+        raise RuntimeError("初始化授权流程失败")
+
+    login_start = engine._submit_login_start(did, sen_token)
+    if not login_start.success:
+        raise RuntimeError(login_start.error_message or "提交登录入口失败")
+
+    if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+        password_result = engine._submit_login_password()
+        if not password_result.success or not password_result.is_existing_account:
+            raise RuntimeError(password_result.error_message or "提交登录密码失败")
+    elif login_start.page_type != OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+        raise RuntimeError(f"登录入口返回未知页面: {login_start.page_type}")
+
+    registration_result = RegistrationResult(success=False, email=email)
+    ok = engine._complete_token_exchange(registration_result, require_login_otp=True)
+    if not ok:
+        raise RuntimeError(registration_result.error_message or "重登切组同步失败")
+
+    latest_cookies = str(engine._dump_session_cookies() or "").strip()
+    updated = {
+        "access_token": False,
+        "refresh_token": False,
+        "id_token": False,
+        "session_token": False,
+        "cookies": False,
+        "account_id": False,
+        "workspace_id": False,
+    }
+
+    def _apply(field_name: str, value: Optional[str]):
+        text = str(value or "").strip()
+        if text:
+            setattr(account, field_name, text)
+            updated[field_name] = True
+
+    _apply("access_token", registration_result.access_token)
+    _apply("refresh_token", registration_result.refresh_token)
+    _apply("id_token", registration_result.id_token)
+    _apply("session_token", registration_result.session_token)
+    _apply("account_id", registration_result.account_id)
+    _apply("workspace_id", registration_result.workspace_id)
+    if latest_cookies:
+        account.cookies = latest_cookies
+        updated["cookies"] = True
+    account.last_refresh = datetime.utcnow()
+
+    logger.info(
+        "重登切组同步成功: account_id=%s email=%s account_ctx=%s workspace_ctx=%s updated=%s",
+        account.id,
+        account.email,
+        account.account_id or "-",
+        account.workspace_id or "-",
+        ",".join([key for key, value in updated.items() if value]) or "none",
+    )
+    return {
+        "message": "重登切组同步完成",
+        "updated": updated,
+    }
+
+
 def _generate_checkout_link_for_account(
     account: Account,
     request: "CheckoutRequestBase",
@@ -2022,6 +2107,7 @@ def _generate_checkout_link_for_account(
 
 # ============== Pydantic Models ==============
 
+
 class CheckoutRequestBase(BaseModel):
     account_id: int
     plan_type: str  # 'plus' or 'team'
@@ -2034,6 +2120,7 @@ class CheckoutRequestBase(BaseModel):
 
 
 class GenerateLinkRequest(CheckoutRequestBase):
+
     auto_open: bool = False  # 生成后是否自动无痕打开
 
 
@@ -2113,6 +2200,10 @@ class BatchCheckSubscriptionRequest(BaseModel):
 class SaveSessionTokenRequest(BaseModel):
     session_token: str
     merge_cookie: bool = True
+
+
+class ReloginSyncRequest(BaseModel):
+    proxy: Optional[str] = None
 
 
 # ============== 支付链接生成 ==============
@@ -3296,6 +3387,44 @@ def delete_bind_card_task(task_id: int):
 
 
 # ============== 订阅状态 ==============
+
+@router.post("/accounts/{account_id}/relogin-sync")
+def relogin_sync_account(account_id: int, request: ReloginSyncRequest):
+    """重新登录并切换到最新 workspace，回写新 token 与上下文。"""
+    with get_db() as db:
+        account = db.query(Account).filter(Account.id == account_id).first()
+        if not account:
+            raise HTTPException(status_code=404, detail="账号不存在")
+
+        proxy = _resolve_runtime_proxy(request.proxy, account)
+        try:
+            relogin_result = _relogin_and_refresh_account_snapshot(
+                db=db,
+                account=account,
+                proxy=proxy,
+            )
+            result = _detect_and_apply_subscription_result(
+                db=db,
+                account=account,
+                proxy=proxy,
+                allow_token_refresh=False,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("重登切组同步失败: account_id=%s email=%s error=%s", account.id, account.email, exc)
+            raise HTTPException(status_code=500, detail=f"重登切组同步失败: {exc}")
+
+        db.commit()
+        effective_subscription = str(account.subscription_type or "free").lower()
+        return {
+            "success": True,
+            "subscription_type": effective_subscription,
+            "detail": result["detail"],
+            "account_id": account.id,
+            "account_email": account.email,
+            "message": relogin_result.get("message") or "重登切组同步完成",
+        }
 
 @router.post("/accounts/{account_id}/sync-subscription")
 def sync_account_subscription(account_id: int, request: SyncBindCardTaskRequest):

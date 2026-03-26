@@ -325,6 +325,7 @@ function renderAccounts(accounts) {
                         <div class="dropdown-menu" style="min-width:100px;">
                             <a href="#" class="dropdown-item" onclick="event.preventDefault();closeMoreMenu(this);refreshToken(${account.id})">刷新</a>
                             <a href="#" class="dropdown-item" onclick="event.preventDefault();closeMoreMenu(this);uploadAccount(${account.id})">上传</a>
+                            <a href="#" class="dropdown-item" onclick="event.preventDefault();closeMoreMenu(this);reloginSyncAccount(${account.id})">重登切组同步</a>
                             <a href="#" class="dropdown-item" onclick="event.preventDefault();closeMoreMenu(this);syncAccountSubscription(${account.id})">同步订阅</a>
                             <a href="#" class="dropdown-item" onclick="event.preventDefault();closeMoreMenu(this);markSubscription(${account.id})">标记</a>
                         </div>
@@ -1020,6 +1021,27 @@ async function markSubscription(id) {
     }
 }
 
+async function reloginSyncAccount(id) {
+    try {
+        toast.info('正在重登切组并刷新令牌，可能需要等待邮箱验证码...', 4000);
+        const data = await api.post(`/payment/accounts/${id}/relogin-sync`, {});
+        const sub = String(data?.subscription_type || 'free').toUpperCase();
+        const source = String(data?.detail?.source || 'unknown');
+        const confidence = String(data?.detail?.confidence || 'unknown');
+        const note = String(data?.detail?.note || '');
+        const suffix = note ? `, note=${note}` : '';
+        const msg = `${String(data?.message || '重登切组同步完成')}: ${sub} (source=${source}, confidence=${confidence}${suffix})`;
+        if (sub === 'PLUS' || sub === 'TEAM') {
+            toast.success(msg);
+        } else {
+            toast.warning(msg, 8000);
+        }
+        loadAccounts();
+    } catch (e) {
+        toast.error('重登切组同步失败: ' + e.message);
+    }
+}
+
 async function syncAccountSubscription(id) {
     try {
         const data = await api.post(`/payment/accounts/${id}/sync-subscription`, {});
@@ -1361,3 +1383,4 @@ function showInboxCodeResult(code, email) {
 }
 
 window.syncAccountSubscription = syncAccountSubscription;
+window.reloginSyncAccount = reloginSyncAccount;
