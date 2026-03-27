@@ -1834,7 +1834,11 @@ def _relogin_and_refresh_account_snapshot(db, account: Account, proxy: Optional[
     if not registration_result.success:
         raise RuntimeError(registration_result.error_message or "重登切组同步失败")
     if not registration_result.session_token:
-        raise RuntimeError("重登切组同步未获取到 session_token")
+        logger.warning(
+            "重登切组同步未获取到 session_token，但已继续回写 OAuth/上下文字段: account_id=%s email=%s",
+            account.id,
+            account.email,
+        )
 
     latest_cookies = str(engine._dump_session_cookies() or "").strip()
     if registration_result.session_token:

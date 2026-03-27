@@ -370,7 +370,7 @@ def test_relogin_existing_account_skips_login_otp_for_codex_consent(monkeypatch)
     assert calls == [("prepare", "重登切组同步"), ("complete", False)]
 
 
-def test_relogin_existing_account_returns_failure_when_session_token_missing(monkeypatch):
+def test_relogin_existing_account_allows_missing_session_token(monkeypatch):
     engine = RegistrationEngine(FakeEmailService([]))
     engine.email = "tester@example.com"
     engine.password = "secret-pass"
@@ -393,6 +393,9 @@ def test_relogin_existing_account_returns_failure_when_session_token_missing(mon
 
     def fake_complete(result, require_login_otp=True):
         result.access_token = "access-new"
+        result.refresh_token = "refresh-new"
+        result.account_id = "acct-new"
+        result.workspace_id = "ws-new"
         return True
 
     monkeypatch.setattr(engine, "_complete_token_exchange", fake_complete)
@@ -403,5 +406,10 @@ def test_relogin_existing_account_returns_failure_when_session_token_missing(mon
         seed_device_id="did-old",
     )
 
-    assert result.success is False
-    assert result.error_message == "重登未获取到 session_token"
+    assert result.success is True
+    assert result.error_message == ""
+    assert result.session_token == ""
+    assert result.access_token == "access-new"
+    assert result.refresh_token == "refresh-new"
+    assert result.account_id == "acct-new"
+    assert result.workspace_id == "ws-new"

@@ -560,8 +560,10 @@ class RegistrationEngine:
                 result.error_message = "重登失败"
             return result
         if not result.session_token:
-            result.error_message = "重登未获取到 session_token"
-            return result
+            self._log(
+                "重登未获取到 session_token，但已拿到可用 OAuth/上下文字段，按成功返回；如需本地全自动绑卡可后续单独补会话",
+                "warning",
+            )
 
         result.success = True
         return result
