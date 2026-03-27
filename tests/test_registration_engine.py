@@ -4,7 +4,7 @@ import json
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine
+from src.core.register import RegistrationEngine, SignupFormResult
 from src.services.base import BaseEmailService
 
 
@@ -308,42 +308,100 @@ def test_submit_login_password_accepts_codex_consent_without_setting_otp_sent_at
     assert engine._otp_sent_at == 123.0
 
 
-def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
-    session = QueueSession([
-        ("GET", "https://auth.example.test/flow/1", _response_with_did("did-1")),
-        (
-            "POST",
-            OPENAI_API_ENDPOINTS["signup"],
-            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]}}),
-        ),
-        ("POST", OPENAI_API_ENDPOINTS["validate_otp"], _response_with_login_cookies("ws-existing", "session-existing")),
-        (
-            "POST",
-            OPENAI_API_ENDPOINTS["select_workspace"],
-            DummyResponse(payload={"continue_url": "https://auth.example.test/continue-existing"}),
-        ),
-        (
-            "GET",
-            "https://auth.example.test/continue-existing",
-            DummyResponse(
-                status_code=302,
-                headers={"Location": "http://localhost:1455/auth/callback?code=code-1&state=state-1"},
-            ),
-        ),
-    ])
 
-    email_service = FakeEmailService(["246810"])
-    engine = RegistrationEngine(email_service)
-    fake_oauth = FakeOAuthManager()
-    engine.http_client = FakeOpenAIClient([session], ["sentinel-1"])
-    engine.oauth_manager = fake_oauth
 
-    result = engine.run()
+def test_relogin_existing_account_skips_login_otp_for_codex_consent(monkeypatch):
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.email = "tester@example.com"
+    engine.password = "secret-pass"
+
+    calls = []
+
+    class DummyCookies:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, name, value, domain=None, path=None):
+            self.values[(name, domain, path)] = value
+
+    class DummySession:
+        def __init__(self):
+            self.cookies = DummyCookies()
+
+    monkeypatch.setattr(engine, "_init_session", lambda: (setattr(engine, "session", DummySession()) or True))
+    monkeypatch.setattr(engine, "_prepare_authorize_flow", lambda label: (calls.append(("prepare", label)) or ("did-1", "sen-1")))
+    monkeypatch.setattr(
+        engine,
+        "_submit_login_start",
+        lambda did, sen_token: SignupFormResult(success=True, page_type=OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_submit_login_password",
+        lambda: SignupFormResult(
+            success=True,
+            page_type=OPENAI_PAGE_TYPES["SIGN_IN_WITH_CHATGPT_CODEX_CONSENT"],
+            is_existing_account=True,
+        ),
+    )
+    monkeypatch.setattr(engine, "_resolve_login_password_transition", lambda password_result: (True, False, password_result.page_type))
+
+    def fake_complete(result, require_login_otp=True):
+        calls.append(("complete", require_login_otp))
+        result.access_token = "access-new"
+        result.refresh_token = "refresh-new"
+        result.id_token = "id-new"
+        result.session_token = "session-new"
+        result.account_id = "acct-new"
+        result.workspace_id = "ws-new"
+        return True
+
+    monkeypatch.setattr(engine, "_complete_token_exchange", fake_complete)
+
+    result = engine.relogin_existing_account(
+        label="重登切组同步",
+        seed_cookies_text="foo=bar; oai-did=did-old; __Secure-next-auth.session-token=session-old",
+        seed_device_id="did-old",
+    )
 
     assert result.success is True
-    assert result.source == "login"
-    assert fake_oauth.start_calls == 1
-    assert sum(1 for call in session.calls if call["url"] == OPENAI_API_ENDPOINTS["send_otp"]) == 0
-    assert len(email_service.otp_requests) == 1
-    assert email_service.otp_requests[0]["otp_sent_at"] is not None
-    assert result.metadata["token_acquired_via_relogin"] is False
+    assert result.session_token == "session-new"
+    assert result.access_token == "access-new"
+    assert calls == [("prepare", "重登切组同步"), ("complete", False)]
+
+
+def test_relogin_existing_account_returns_failure_when_session_token_missing(monkeypatch):
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.email = "tester@example.com"
+    engine.password = "secret-pass"
+
+    class DummyCookies:
+        def set(self, name, value, domain=None, path=None):
+            return None
+
+    class DummySession:
+        def __init__(self):
+            self.cookies = DummyCookies()
+
+    monkeypatch.setattr(engine, "_init_session", lambda: (setattr(engine, "session", DummySession()) or True))
+    monkeypatch.setattr(engine, "_prepare_authorize_flow", lambda label: ("did-1", "sen-1"))
+    monkeypatch.setattr(
+        engine,
+        "_submit_login_start",
+        lambda did, sen_token: SignupFormResult(success=True, page_type=OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]),
+    )
+
+    def fake_complete(result, require_login_otp=True):
+        result.access_token = "access-new"
+        return True
+
+    monkeypatch.setattr(engine, "_complete_token_exchange", fake_complete)
+
+    result = engine.relogin_existing_account(
+        label="会话补全登录",
+        seed_cookies_text="foo=bar",
+        seed_device_id="did-old",
+    )
+
+    assert result.success is False
+    assert result.error_message == "重登未获取到 session_token"

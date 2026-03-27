@@ -6,8 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from src.config.constants import OPENAI_PAGE_TYPES
-from src.core.register import SignupFormResult
+from src.core.register import RegistrationResult
 from src.database.models import Base, Account
 from src.database.session import DatabaseSessionManager
 from src.web.routes import payment as payment_routes
@@ -150,29 +149,14 @@ def test_account_relogin_sync_returns_404_for_missing_account(monkeypatch):
     assert response.json()["detail"] == "账号不存在"
 
 
-
-
-def test_account_relogin_sync_accepts_codex_consent_and_skips_login_otp(monkeypatch):
+def test_account_relogin_sync_delegates_to_engine_relogin(monkeypatch):
     manager = _create_manager("payment_relogin_sync_codex_consent.db")
     account_id, _ = _create_account(manager)
 
     with manager.session_scope() as session:
         account = session.get(Account, account_id)
         account.cookies = "foo=bar; oai-did=did-old; __Secure-next-auth.session-token=session-old"
-        calls = []
-        seeded = []
-        ensured = []
-
-        class DummyCookies:
-            def __init__(self):
-                self.values = {}
-
-            def set(self, name, value, domain=None, path=None):
-                self.values[(name, domain, path)] = value
-
-        class DummySession:
-            def __init__(self):
-                self.cookies = DummyCookies()
+        delegated = []
 
         class StubEngine:
             def __init__(self, *, email_service, proxy_url, callback_logger, task_uuid):
@@ -183,60 +167,31 @@ def test_account_relogin_sync_accepts_codex_consent_and_skips_login_otp(monkeypa
                 self.email = None
                 self.password = None
                 self.email_info = None
-                self._is_existing_account = False
-                self.session = DummySession()
 
-            def _init_session(self):
-                calls.append("init_session")
-                return True
-
-            def _prepare_authorize_flow(self, label):
-                calls.append(("prepare", label))
-                return "did-1", "sen-1"
-
-            def _submit_login_start(self, did, sen_token):
-                return SignupFormResult(success=True, page_type=OPENAI_PAGE_TYPES["LOGIN_PASSWORD"])
-
-            def _submit_login_password(self):
-                return SignupFormResult(
+            def relogin_existing_account(self, *, label, seed_cookies_text=None, seed_device_id=None):
+                delegated.append((label, seed_cookies_text, seed_device_id))
+                return RegistrationResult(
                     success=True,
-                    page_type=OPENAI_PAGE_TYPES["SIGN_IN_WITH_CHATGPT_CODEX_CONSENT"],
-                    is_existing_account=True,
+                    email="tester@example.com",
+                    access_token="access-new",
+                    refresh_token="refresh-new",
+                    id_token="id-new",
+                    session_token="session-new",
+                    account_id="acct-new",
+                    workspace_id="ws-new",
                 )
-
-            def _resolve_login_password_transition(self, password_result):
-                return True, False, password_result.page_type
-
-            def _complete_token_exchange(self, result, require_login_otp=True):
-                calls.append(require_login_otp)
-                result.access_token = "access-new"
-                result.refresh_token = "refresh-new"
-                result.id_token = "id-new"
-                result.account_id = "acct-new"
-                result.workspace_id = "ws-new"
-                return True
-
-            def _ensure_session_token_strict(self, result, max_rounds=2):
-                ensured.append(max_rounds)
-                result.session_token = "session-new"
-                return True
 
             def _dump_session_cookies(self):
                 return "foo=bar; oai-did=did-old"
 
-        def fake_seed(session_obj, cookies_text):
-            seeded.append(cookies_text)
-
         monkeypatch.setattr(payment_routes, "_resolve_email_service_for_account_session_bootstrap", lambda db, account, proxy: object())
         monkeypatch.setattr(payment_routes, "RegistrationEngine", StubEngine)
-        monkeypatch.setattr(payment_routes, "_seed_cookie_jar_from_text", fake_seed)
+        monkeypatch.setattr(payment_routes, "_resolve_account_device_id", lambda account: "did-old")
 
         result = payment_routes._relogin_and_refresh_account_snapshot(session, account, proxy=None)
 
         assert result["message"] == "重登切组同步完成"
-        assert calls == ["init_session", ("prepare", "重登切组同步"), False]
-        assert seeded == ["foo=bar; oai-did=did-old; __Secure-next-auth.session-token=session-old", "foo=bar; oai-did=did-old; __Secure-next-auth.session-token=session-old"]
-        assert ensured == [2]
+        assert delegated == [("重登切组同步", "foo=bar; oai-did=did-old; __Secure-next-auth.session-token=session-old", "did-old")]
         assert account.access_token == "access-new"
         assert account.refresh_token == "refresh-new"
         assert account.id_token == "id-new"
@@ -247,7 +202,7 @@ def test_account_relogin_sync_accepts_codex_consent_and_skips_login_otp(monkeypa
         assert account.last_refresh is not None
 
 
-def test_account_relogin_sync_raises_unknown_page_after_password(monkeypatch):
+def test_account_relogin_sync_raises_engine_error(monkeypatch):
     manager = _create_manager("payment_relogin_sync_unknown_page.db")
     account_id, _ = _create_account(manager)
 
@@ -259,24 +214,54 @@ def test_account_relogin_sync_raises_unknown_page_after_password(monkeypatch):
                 self.email = None
                 self.password = None
                 self.email_info = None
-                self._is_existing_account = False
 
-            def _prepare_authorize_flow(self, label):
-                return "did-1", "sen-1"
-
-            def _submit_login_start(self, did, sen_token):
-                return SignupFormResult(success=True, page_type=OPENAI_PAGE_TYPES["LOGIN_PASSWORD"])
-
-            def _submit_login_password(self):
-                return SignupFormResult(success=True, page_type="some_unknown_page", is_existing_account=False)
-
-            def _resolve_login_password_transition(self, password_result):
-                return False, False, password_result.page_type
+            def relogin_existing_account(self, *, label, seed_cookies_text=None, seed_device_id=None):
+                return RegistrationResult(success=False, error_message="登录密码后返回未知页面: some_unknown_page")
 
         monkeypatch.setattr(payment_routes, "_resolve_email_service_for_account_session_bootstrap", lambda db, account, proxy: object())
         monkeypatch.setattr(payment_routes, "RegistrationEngine", StubEngine)
         with pytest.raises(RuntimeError, match="登录密码后返回未知页面: some_unknown_page"):
             payment_routes._relogin_and_refresh_account_snapshot(session, account, proxy=None)
+
+
+def test_extract_session_token_helpers_support_secure_and_chunked_values():
+    cookie_text = "foo=bar; _Secure-next-auth.session-token=token-secure"
+    assert payment_routes._extract_session_token_from_cookie_text(cookie_text) == "token-secure"
+
+    chunked_text = (
+        "foo=bar; __Secure-next-auth.session-token.0=chunk-a; "
+        "__Secure-next-auth.session-token.1=chunk-b"
+    )
+    assert payment_routes._extract_session_token_from_cookie_text(chunked_text) == "chunk-achunk-b"
+    assert payment_routes._extract_session_token_chunks_from_cookie_text(chunked_text) == [0, 1]
+
+
+class _DummyCookieJar:
+    def __init__(self, pairs):
+        self._pairs = list(pairs)
+        self.jar = []
+
+    def items(self):
+        return list(self._pairs)
+
+    def get(self, name):
+        for key, value in self._pairs:
+            if key == name:
+                return value
+        return None
+
+
+def test_extract_session_token_from_cookie_jar_prefers_secure_and_chunked_values():
+    jar = _DummyCookieJar([
+        ("_Secure-next-auth.session-token", "token-direct"),
+    ])
+    assert payment_routes._extract_session_token_from_cookie_jar(jar) == "token-direct"
+
+    chunked_jar = _DummyCookieJar([
+        ("__Secure-next-auth.session-token.0", "chunk-a"),
+        ("__Secure-next-auth.session-token.1", "chunk-b"),
+    ])
+    assert payment_routes._extract_session_token_from_cookie_jar(chunked_jar) == "chunk-achunk-b"
 
 
 def test_account_relogin_sync_returns_500_when_relogin_fails(monkeypatch):

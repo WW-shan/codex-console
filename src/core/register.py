@@ -475,6 +475,97 @@ class RegistrationEngine:
             self._log(f"初始化会话失败: {e}", "error")
             return False
 
+    def _prime_existing_account_session(
+        self,
+        cookies_text: Optional[str] = None,
+        device_id: Optional[str] = None,
+    ) -> None:
+        session_obj = getattr(self, "session", None)
+        if session_obj is None:
+            return
+
+        text = str(cookies_text or "").strip()
+        if text:
+            for item in text.split(";"):
+                raw = str(item or "").strip()
+                if not raw or "=" not in raw:
+                    continue
+                name, value = raw.split("=", 1)
+                key = str(name or "").strip()
+                val = str(value or "").strip()
+                if not key:
+                    continue
+                for domain in (".chatgpt.com", "chatgpt.com"):
+                    try:
+                        session_obj.cookies.set(key, val, domain=domain, path="/")
+                    except Exception:
+                        continue
+
+        did = str(device_id or "").strip()
+        if did:
+            try:
+                session_obj.cookies.set("oai-did", did, domain=".chatgpt.com", path="/")
+            except Exception:
+                pass
+
+    def relogin_existing_account(
+        self,
+        *,
+        label: str,
+        seed_cookies_text: Optional[str] = None,
+        seed_device_id: Optional[str] = None,
+    ) -> RegistrationResult:
+        result = RegistrationResult(success=False, email=str(self.email or "").strip())
+        self._is_existing_account = True
+
+        self._log(
+            f"{label}: 复用注册收尾链路重登，seed_cookies={'有' if bool(str(seed_cookies_text or '').strip()) else '无'}, "
+            f"seed_device_id={'有' if bool(str(seed_device_id or '').strip()) else '无'}, "
+            f"seed_session={'有' if bool(self._extract_session_token_from_cookie_text(str(seed_cookies_text or ''))) else '无'}"
+        )
+
+        if not self._init_session():
+            result.error_message = "初始化会话失败"
+            return result
+        self._prime_existing_account_session(seed_cookies_text, seed_device_id)
+
+        did, sen_token = self._prepare_authorize_flow(label)
+        if not did:
+            result.error_message = "初始化授权流程失败"
+            return result
+
+        self._prime_existing_account_session(seed_cookies_text, seed_device_id)
+
+        login_start = self._submit_login_start(did, sen_token)
+        if not login_start.success:
+            result.error_message = login_start.error_message or "提交登录入口失败"
+            return result
+
+        require_login_otp = True
+        if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+            password_result = self._submit_login_password()
+            login_ready, require_login_otp, password_page_type = self._resolve_login_password_transition(password_result)
+            if not login_ready:
+                if not password_result.success:
+                    result.error_message = password_result.error_message or "提交登录密码失败"
+                else:
+                    result.error_message = f"登录密码后返回未知页面: {password_page_type or 'unknown'}"
+                return result
+        elif login_start.page_type != OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+            result.error_message = f"登录入口返回未知页面: {login_start.page_type}"
+            return result
+
+        if not self._complete_token_exchange(result, require_login_otp=require_login_otp):
+            if not result.error_message:
+                result.error_message = "重登失败"
+            return result
+        if not result.session_token:
+            result.error_message = "重登未获取到 session_token"
+            return result
+
+        result.success = True
+        return result
+
     def _get_device_id(self) -> Optional[str]:
         """获取 Device ID"""
         if not self.oauth_start:

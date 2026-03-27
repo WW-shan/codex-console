@@ -20,9 +20,8 @@ from curl_cffi import requests as cffi_requests
 from ...database.session import get_db
 from ...database.models import Account, BindCardTask, EmailService as EmailServiceModel
 from ...config.settings import get_settings
-from ...config.constants import OPENAI_PAGE_TYPES
 from ...services import EmailServiceFactory, EmailServiceType
-from ...core.register import RegistrationEngine, RegistrationResult
+from ...core.register import RegistrationEngine
 from .accounts import resolve_account_ids
 from ...core.openai.payment import (
     generate_plus_checkout_bundle,
@@ -249,59 +248,11 @@ def _extract_cookie_value(cookies_text: Optional[str], cookie_name: str) -> str:
 
 
 def _extract_session_token_from_cookie_text(cookies_text: Optional[str]) -> str:
-    text = str(cookies_text or "")
-    if not text:
-        return ""
-
-    direct = _extract_cookie_value(text, "__Secure-next-auth.session-token")
-    if direct:
-        return direct
-
-    # NextAuth 可能把大 token 分片为 .0/.1/.2...
-    chunks: dict[int, str] = {}
-    for raw in text.split(";"):
-        item = str(raw or "").strip()
-        if not item or "=" not in item:
-            continue
-        name, value = item.split("=", 1)
-        key = str(name or "").strip()
-        if not key.startswith("__Secure-next-auth.session-token."):
-            continue
-        try:
-            idx = int(key.rsplit(".", 1)[-1])
-        except Exception:
-            continue
-        chunks[idx] = str(value or "").strip()
-    if chunks:
-        return "".join(chunks[idx] for idx in sorted(chunks.keys()))
-    return ""
+    return RegistrationEngine._extract_session_token_from_cookie_text(str(cookies_text or ""))
 
 
 def _extract_session_token_from_cookie_jar(cookie_jar) -> str:
-    try:
-        direct = str(cookie_jar.get("__Secure-next-auth.session-token") or "").strip()
-    except Exception:
-        direct = ""
-    if direct:
-        return direct
-
-    chunks: dict[int, str] = {}
-    try:
-        items = list(cookie_jar.items())
-    except Exception:
-        items = []
-    for key, value in items:
-        name = str(key or "").strip()
-        if not name.startswith("__Secure-next-auth.session-token."):
-            continue
-        try:
-            idx = int(name.rsplit(".", 1)[-1])
-        except Exception:
-            continue
-        chunks[idx] = str(value or "").strip()
-    if chunks:
-        return "".join(chunks[idx] for idx in sorted(chunks.keys()))
-    return ""
+    return RegistrationEngine._extract_session_token_from_cookie_jar(cookie_jar)
 
 
 def _extract_session_token_chunks_from_cookie_text(cookies_text: Optional[str]) -> List[int]:
@@ -310,16 +261,9 @@ def _extract_session_token_chunks_from_cookie_text(cookies_text: Optional[str]) 
         return []
     indices: List[int] = []
     seen = set()
-    for raw in text.split(";"):
-        item = str(raw or "").strip()
-        if not item or "=" not in item:
-            continue
-        name, _ = item.split("=", 1)
-        key = str(name or "").strip()
-        if not key.startswith("__Secure-next-auth.session-token."):
-            continue
+    for raw in re.findall(r"(?:^|[;,]\s*)((?:__|_)Secure-next-auth\.session-token\.(\d+))=", text):
         try:
-            idx = int(key.rsplit(".", 1)[-1])
+            idx = int(raw[1])
         except Exception:
             continue
         if idx in seen:
@@ -404,20 +348,13 @@ def _probe_auth_session_context(account: Account, proxy: Optional[str]) -> dict:
         if not session_token:
             session_token = _extract_session_token_from_cookie_jar(getattr(session, "cookies", None))
         if not session_token:
-            set_cookie = (
-                " | ".join(resp.headers.get_list("set-cookie"))
-                if hasattr(resp.headers, "get_list")
-                else str(resp.headers.get("set-cookie") or "")
-            )
-            match_direct = re.search(r"__Secure-next-auth\.session-token=([^;,\s]+)", set_cookie)
-            if match_direct:
-                session_token = str(match_direct.group(1) or "").strip()
-            else:
-                chunk_matches = re.findall(r"__Secure-next-auth\.session-token\.(\d+)=([^;,\s]+)", set_cookie)
-                if chunk_matches:
-                    chunk_map = {int(i): v for i, v in chunk_matches if str(i).isdigit()}
-                    if chunk_map:
-                        session_token = "".join(chunk_map[idx] for idx in sorted(chunk_map.keys()))
+            set_cookie = RegistrationEngine._flatten_set_cookie_headers(resp)
+            if set_cookie:
+                session_token = _extract_session_token_from_cookie_text(set_cookie)
+        if not session_token:
+            request_cookie = RegistrationEngine._extract_request_cookie_header(resp)
+            if request_cookie:
+                session_token = _extract_session_token_from_cookie_text(request_cookie)
 
         payload = {}
         try:
@@ -505,20 +442,13 @@ def _force_fetch_nextauth_session_token(
             if not token:
                 token = _extract_session_token_from_cookie_jar(getattr(session, "cookies", None))
             if not token:
-                set_cookie = (
-                    " | ".join(resp.headers.get_list("set-cookie"))
-                    if hasattr(resp.headers, "get_list")
-                    else str(resp.headers.get("set-cookie") or "")
-                )
-                match_direct = re.search(r"__Secure-next-auth\.session-token=([^;,\s]+)", set_cookie)
-                if match_direct:
-                    token = str(match_direct.group(1) or "").strip()
-                else:
-                    chunk_matches = re.findall(r"__Secure-next-auth\.session-token\.(\d+)=([^;,\s]+)", set_cookie)
-                    if chunk_matches:
-                        chunk_map = {int(i): v for i, v in chunk_matches if str(i).isdigit()}
-                        if chunk_map:
-                            token = "".join(chunk_map[idx] for idx in sorted(chunk_map.keys()))
+                set_cookie = RegistrationEngine._flatten_set_cookie_headers(resp)
+                if set_cookie:
+                    token = _extract_session_token_from_cookie_text(set_cookie)
+            if not token:
+                request_cookie = RegistrationEngine._extract_request_cookie_header(resp)
+                if request_cookie:
+                    token = _extract_session_token_from_cookie_text(request_cookie)
 
             fresh_access = ""
             try:
@@ -550,20 +480,15 @@ def _extract_session_token_from_auth_response(resp, session) -> str:
     if token:
         return token
 
-    set_cookie = (
-        " | ".join(resp.headers.get_list("set-cookie"))
-        if hasattr(resp.headers, "get_list")
-        else str(resp.headers.get("set-cookie") or "")
-    )
-    match_direct = re.search(r"__Secure-next-auth\.session-token=([^;,\s]+)", set_cookie)
-    if match_direct:
-        return str(match_direct.group(1) or "").strip()
+    set_cookie = RegistrationEngine._flatten_set_cookie_headers(resp)
+    if set_cookie:
+        token = _extract_session_token_from_cookie_text(set_cookie)
+        if token:
+            return token
 
-    chunk_matches = re.findall(r"__Secure-next-auth\.session-token\.(\d+)=([^;,\s]+)", set_cookie)
-    if chunk_matches:
-        chunk_map = {int(i): v for i, v in chunk_matches if str(i).isdigit()}
-        if chunk_map:
-            return "".join(chunk_map[idx] for idx in sorted(chunk_map.keys()))
+    request_cookie = RegistrationEngine._extract_request_cookie_header(resp)
+    if request_cookie:
+        return _extract_session_token_from_cookie_text(request_cookie)
     return ""
 
 
@@ -859,126 +784,48 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
     engine.email_info = {"service_id": account.email_service_id} if account.email_service_id else {}
 
     try:
-        did, sen_token = engine._prepare_authorize_flow("会话补全登录")
-        if not did:
-            return ""
-        if not sen_token:
-            # 对齐 ABCard：sentinel 偶发失败时，仍尝试无 sentinel 登录链路，避免卡死。
+        registration_result = engine.relogin_existing_account(
+            label="会话补全登录",
+            seed_cookies_text=str(account.cookies or "").strip(),
+            seed_device_id=_resolve_account_device_id(account),
+        )
+        if not registration_result.success or not registration_result.session_token:
             logger.warning(
-                "会话补全登录 sentinel 缺失，继续尝试无 sentinel 登录: account_id=%s email=%s",
+                "会话补全登录未拿到 session_token: account_id=%s email=%s error=%s",
                 account.id,
                 account.email,
+                registration_result.error_message or "missing_session_token",
             )
-
-        login_start = engine._submit_login_start(did, sen_token)
-        if not login_start.success:
-            if _is_region_block_error_text(login_start.error_message):
-                logger.warning(
-                    "会话补全登录入口地区受限: account_id=%s email=%s proxy=%s error=%s",
-                    account.id,
-                    account.email,
-                    "on" if proxy else "off",
-                    login_start.error_message,
-                )
-            logger.warning(
-                "会话补全登录入口失败: account_id=%s email=%s error=%s",
-                account.id,
-                account.email,
-                login_start.error_message,
-            )
-            return ""
-
-        require_login_otp = True
-        if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
-            password_result = engine._submit_login_password()
-            login_ready, require_login_otp, password_page_type = engine._resolve_login_password_transition(password_result)
-            if not login_ready:
-                logger.warning(
-                    "会话补全登录密码阶段失败: account_id=%s email=%s page_type=%s err=%s",
-                    account.id,
-                    account.email,
-                    password_page_type,
-                    password_result.error_message,
-                )
-                return ""
-        elif login_start.page_type != OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
-            logger.warning(
-                "会话补全登录入口返回未知页面: account_id=%s email=%s page_type=%s",
-                account.id,
-                account.email,
-                login_start.page_type,
-            )
-            return ""
-
-        if require_login_otp:
-            engine._log("等待登录验证码到场，最后这位嘉宾还在路上...")
-            engine._log("核对登录验证码，验明正身一下...")
-            if not engine._verify_email_otp_with_retry(stage_label="会话补全验证码", max_attempts=3):
-                logger.warning(
-                    "会话补全登录验证码阶段失败: account_id=%s email=%s",
-                    account.id,
-                    account.email,
-                )
-                return ""
-
-        fresh_cookies = engine._dump_session_cookies()
-        # 兜底拼装关键 cookie，避免个别环境 cookie jar 导出不全。
-        try:
-            did_cookie = str(engine.session.cookies.get("oai-did") or "").strip() if engine.session else ""
-        except Exception:
-            did_cookie = ""
-        try:
-            auth_cookie = (
-                engine._get_cookie_value(
-                    engine.session.cookies,
-                    "oai-client-auth-session",
-                    preferred_domains=[".auth.openai.com", "auth.openai.com", ".chatgpt.com", "chatgpt.com"],
-                )
-                if engine.session and hasattr(engine, "_get_cookie_value")
-                else ""
-            )
-        except Exception:
-            auth_cookie = ""
-        if did_cookie:
-            fresh_cookies = _upsert_cookie(fresh_cookies, "oai-did", did_cookie)
-        if auth_cookie:
-            fresh_cookies = _upsert_cookie(fresh_cookies, "oai-client-auth-session", auth_cookie)
-
-        session_token = _extract_session_token_from_cookie_text(fresh_cookies)
-        forced_access = str(account.access_token or "").strip()
-        if not session_token:
-            forced_token, forced_access_new = _force_fetch_nextauth_session_token(
-                access_token=forced_access,
-                cookies_text=fresh_cookies,
-                device_id=did_cookie or _resolve_account_device_id(account),
-                proxy=proxy,
-            )
-            if forced_token:
-                session_token = forced_token
-                fresh_cookies = _upsert_cookie(fresh_cookies, "__Secure-next-auth.session-token", forced_token)
-            if forced_access_new:
-                forced_access = forced_access_new
-
-        if not session_token:
-            logger.warning("会话补全登录未拿到 session_token: account_id=%s email=%s", account.id, account.email)
-            if fresh_cookies:
-                account.cookies = fresh_cookies
-                if forced_access:
-                    account.access_token = forced_access
+            latest_cookies = str(engine._dump_session_cookies() or "").strip()
+            if latest_cookies:
+                account.cookies = latest_cookies
+                if registration_result.access_token:
+                    account.access_token = registration_result.access_token
                 account.last_refresh = datetime.utcnow()
                 db.commit()
             return ""
 
-        if forced_access:
-            account.access_token = forced_access
-        if fresh_cookies:
-            account.cookies = fresh_cookies
-        account.session_token = session_token
+        latest_cookies = str(engine._dump_session_cookies() or "").strip()
+        if registration_result.session_token:
+            latest_cookies = _upsert_cookie(
+                latest_cookies or str(account.cookies or "").strip(),
+                "__Secure-next-auth.session-token",
+                registration_result.session_token,
+            )
+        if registration_result.access_token:
+            account.access_token = registration_result.access_token
+        if registration_result.refresh_token:
+            account.refresh_token = registration_result.refresh_token
+        if registration_result.id_token:
+            account.id_token = registration_result.id_token
+        if latest_cookies:
+            account.cookies = latest_cookies
+        account.session_token = registration_result.session_token
         account.last_refresh = datetime.utcnow()
         db.commit()
         db.refresh(account)
         logger.info("会话补全登录成功: account_id=%s email=%s", account.id, account.email)
-        return session_token
+        return registration_result.session_token
     except Exception as exc:
         logger.warning("会话补全登录异常: account_id=%s email=%s error=%s", account.id, account.email, exc)
         return ""
@@ -1057,19 +904,14 @@ def _bootstrap_session_token_for_local_auto(db, account: Account, proxy: Optiona
         token_inner = _extract_session_token_from_cookie_jar(getattr(session, "cookies", None))
         if token_inner:
             return token_inner
-        set_cookie = (
-            " | ".join(resp.headers.get_list("set-cookie"))
-            if hasattr(resp.headers, "get_list")
-            else str(resp.headers.get("set-cookie") or "")
-        )
-        match_direct = re.search(r"__Secure-next-auth\.session-token=([^;,\s]+)", set_cookie)
-        if match_direct:
-            return str(match_direct.group(1) or "").strip()
-        chunk_matches = re.findall(r"__Secure-next-auth\.session-token\.(\d+)=([^;,\s]+)", set_cookie)
-        if chunk_matches:
-            chunk_map = {int(i): v for i, v in chunk_matches if str(i).isdigit()}
-            if chunk_map:
-                return "".join(chunk_map[idx] for idx in sorted(chunk_map.keys()))
+        set_cookie = RegistrationEngine._flatten_set_cookie_headers(resp)
+        if set_cookie:
+            token_inner = _extract_session_token_from_cookie_text(set_cookie)
+            if token_inner:
+                return token_inner
+        request_cookie = RegistrationEngine._extract_request_cookie_header(resp)
+        if request_cookie:
+            return _extract_session_token_from_cookie_text(request_cookie)
         return ""
 
     def _request_session_token(
@@ -1983,59 +1825,16 @@ def _relogin_and_refresh_account_snapshot(db, account: Account, proxy: Optional[
     engine.email = email
     engine.password = password
     engine.email_info = {"service_id": account.email_service_id} if account.email_service_id else {}
-    engine._is_existing_account = True
 
-    def _prime_engine_session_from_account() -> None:
-        session_obj = getattr(engine, "session", None)
-        if session_obj is None:
-            return
-        cookies_text = str(account.cookies or "").strip()
-        if cookies_text:
-            _seed_cookie_jar_from_text(session_obj, cookies_text)
-        device_id = _resolve_account_device_id(account)
-        if device_id:
-            try:
-                session_obj.cookies.set("oai-did", device_id, domain=".chatgpt.com", path="/")
-            except Exception:
-                pass
-
-    init_session = getattr(engine, "_init_session", None)
-    if callable(init_session):
-        try:
-            if init_session():
-                _prime_engine_session_from_account()
-        except Exception:
-            pass
-
-    did, sen_token = engine._prepare_authorize_flow("重登切组同步")
-    if not did:
-        raise RuntimeError("初始化授权流程失败")
-    _prime_engine_session_from_account()
-
-    login_start = engine._submit_login_start(did, sen_token)
-    if not login_start.success:
-        raise RuntimeError(login_start.error_message or "提交登录入口失败")
-
-    require_login_otp = True
-    if login_start.page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
-        password_result = engine._submit_login_password()
-        login_ready, require_login_otp, password_page_type = engine._resolve_login_password_transition(password_result)
-        if not login_ready:
-            if not password_result.success:
-                raise RuntimeError(password_result.error_message or "提交登录密码失败")
-            raise RuntimeError(f"登录密码后返回未知页面: {password_page_type or 'unknown'}")
-    elif login_start.page_type != OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
-        raise RuntimeError(f"登录入口返回未知页面: {login_start.page_type}")
-
-    registration_result = RegistrationResult(success=False, email=email)
-    ok = engine._complete_token_exchange(registration_result, require_login_otp=require_login_otp)
-    if not ok:
+    registration_result = engine.relogin_existing_account(
+        label="重登切组同步",
+        seed_cookies_text=str(account.cookies or "").strip(),
+        seed_device_id=_resolve_account_device_id(account),
+    )
+    if not registration_result.success:
         raise RuntimeError(registration_result.error_message or "重登切组同步失败")
-
-    ensure_session_token = getattr(engine, "_ensure_session_token_strict", None)
-    if (not registration_result.session_token) and callable(ensure_session_token):
-        if not ensure_session_token(registration_result, max_rounds=2):
-            raise RuntimeError("重登切组同步未获取到 session_token")
+    if not registration_result.session_token:
+        raise RuntimeError("重登切组同步未获取到 session_token")
 
     latest_cookies = str(engine._dump_session_cookies() or "").strip()
     if registration_result.session_token:
