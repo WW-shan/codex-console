@@ -1515,10 +1515,16 @@ class RegistrationEngine:
             return False
         if not result.session_token:
             native_register_flow = (self.registration_entry_flow == "native") and (not self._is_existing_account)
+            existing_account_relogin = bool(self._is_existing_account)
             if native_register_flow:
                 # 对齐 K:\1\2 备份：原生注册流程里 session_token 不做阻断。
                 self._log(
                     "当前链路未拿到 session_token，先保存账号并标记待补会话（可在账号详情/支付页一键补全）",
+                    "warning",
+                )
+            elif existing_account_relogin:
+                self._log(
+                    "重登链路未拿到 session_token，但 access_token/refresh_token/上下文字段已就位；本次按成功返回，如需本地全自动绑卡可后续单独补会话",
                     "warning",
                 )
             else:

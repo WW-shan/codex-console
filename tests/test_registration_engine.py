@@ -390,6 +390,7 @@ def test_relogin_existing_account_allows_missing_session_token(monkeypatch):
         "_submit_login_start",
         lambda did, sen_token: SignupFormResult(success=True, page_type=OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]),
     )
+    monkeypatch.setattr(engine, "_ensure_session_token_strict", lambda result, max_rounds=2: False)
 
     def fake_complete(result, require_login_otp=True):
         result.access_token = "access-new"
