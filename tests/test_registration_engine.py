@@ -255,6 +255,38 @@ def test_run_registers_then_relogs_to_fetch_token():
     assert result.metadata["token_acquired_via_relogin"] is True
 
 
+
+
+def test_get_workspace_id_prefers_auth_openai_cookie_when_duplicate_names_exist():
+    class CookieEntry:
+        def __init__(self, name, value, domain):
+            self.name = name
+            self.value = value
+            self.domain = domain
+
+    class CookieBag(dict):
+        def __init__(self, jar_entries):
+            super().__init__()
+            self.jar = list(jar_entries)
+
+        def get(self, key, default=None):
+            raise RuntimeError("duplicate cookie names")
+
+    class SessionWithDuplicateCookies:
+        def __init__(self):
+            self.cookies = CookieBag(
+                [
+                    CookieEntry("oai-client-auth-session", _workspace_cookie("ws-auth"), ".auth.openai.com"),
+                    CookieEntry("oai-client-auth-session", _workspace_cookie("ws-chatgpt"), ".chatgpt.com"),
+                ]
+            )
+
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = SessionWithDuplicateCookies()
+
+    assert engine._get_workspace_id() == "ws-auth"
+
+
 def test_submit_login_password_accepts_codex_consent_without_setting_otp_sent_at():
     session = QueueSession([
         (

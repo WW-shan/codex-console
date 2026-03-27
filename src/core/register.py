@@ -323,6 +323,49 @@ class RegistrationEngine:
         return ""
 
     @staticmethod
+    def _get_cookie_value(cookie_jar, cookie_name: str, preferred_domains: Optional[List[str]] = None) -> str:
+        """
+        从 CookieJar 安全读取指定 cookie，兼容同名跨域 cookie。
+        优先使用 preferred_domains，其次回退任意非空值。
+        """
+        if cookie_jar is None:
+            return ""
+
+        entries: list[tuple[str, str, str]] = []
+        try:
+            jar = getattr(cookie_jar, "jar", None)
+            if jar is not None:
+                for cookie in jar:
+                    entries.append(
+                        (
+                            str(getattr(cookie, "name", "") or "").strip(),
+                            str(getattr(cookie, "value", "") or "").strip(),
+                            str(getattr(cookie, "domain", "") or "").strip().lower(),
+                        )
+                    )
+        except Exception:
+            pass
+
+        preferred = [str(item or "").strip().lower() for item in (preferred_domains or []) if str(item or "").strip()]
+        candidates = [entry for entry in entries if entry[0] == cookie_name and entry[1]]
+        if candidates:
+            for domain in preferred:
+                domain_candidates = [
+                    value for name, value, cookie_domain in candidates
+                    if cookie_domain == domain or cookie_domain == domain.lstrip(".") or cookie_domain.endswith(domain)
+                ]
+                if domain_candidates:
+                    return max(domain_candidates, key=len)
+            return max((value for _name, value, _domain in candidates), key=len)
+
+        try:
+            if hasattr(cookie_jar, "get"):
+                return str(cookie_jar.get(cookie_name) or "").strip()
+        except Exception:
+            return ""
+        return ""
+
+    @staticmethod
     def _flatten_set_cookie_headers(response) -> str:
         """
         合并多条 Set-Cookie（包含分片 cookie）。
@@ -2426,7 +2469,11 @@ class RegistrationEngine:
                     return str((workspaces[0] or {}).get("id") or "").strip()
                 return ""
 
-            auth_cookie = str(self.session.cookies.get("oai-client-auth-session") or "").strip()
+            auth_cookie = self._get_cookie_value(
+                self.session.cookies,
+                "oai-client-auth-session",
+                preferred_domains=[".auth.openai.com", "auth.openai.com", ".chatgpt.com", "chatgpt.com"],
+            )
             if not auth_cookie:
                 self._log("未能获取到授权 Cookie，尝试从 auth-info 里取 workspace", "warning")
 
@@ -2468,7 +2515,11 @@ class RegistrationEngine:
                         return workspace_id
 
                 # 兜底：从 oai-client-auth-info（URL 编码 JSON）提取 workspace
-                auth_info_raw = str(self.session.cookies.get("oai-client-auth-info") or "").strip()
+                auth_info_raw = self._get_cookie_value(
+                    self.session.cookies,
+                    "oai-client-auth-info",
+                    preferred_domains=[".auth.openai.com", "auth.openai.com", ".chatgpt.com", "chatgpt.com"],
+                )
                 if auth_info_raw:
                     auth_info_text = auth_info_raw
                     for _ in range(2):

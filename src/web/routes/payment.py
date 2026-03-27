@@ -928,7 +928,15 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
         except Exception:
             did_cookie = ""
         try:
-            auth_cookie = str(engine.session.cookies.get("oai-client-auth-session") or "").strip() if engine.session else ""
+            auth_cookie = (
+                engine._get_cookie_value(
+                    engine.session.cookies,
+                    "oai-client-auth-session",
+                    preferred_domains=[".auth.openai.com", "auth.openai.com", ".chatgpt.com", "chatgpt.com"],
+                )
+                if engine.session and hasattr(engine, "_get_cookie_value")
+                else ""
+            )
         except Exception:
             auth_cookie = ""
         if did_cookie:
